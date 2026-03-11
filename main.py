@@ -1,0 +1,2516 @@
+"""
+Bot Telegram - Gestionnaire d'Accès Multi-Canal
+Autonome: fonctionne sur plusieurs canaux simultanément
+Assistante IA: répond automatiquement aux utilisateurs
+"""
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters
+)
+
+from config import BOT_TOKEN, ADMINS, PORT, DATA_FILE, CHECK_INTERVAL, GEMINI_API_KEY, TELETHON_API_ID, TELETHON_API_HASH
+import telethon_manager
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# IA Gemini
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        from google import genai as google_genai
+        from google.genai import types as genai_types
+        gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("✅ Assistant IA Gemini initialisé")
+    except Exception as e:
+        logger.warning(f"⚠️ Impossible d'initialiser Gemini: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# CONSTANTES PAIEMENT
+# ═══════════════════════════════════════════════════════════════
+PRICE_PER_DAY_FCFA = 1000   # 1 000 FCFA = 1 jour (50 USD = 30 000 FCFA = 30 jours)
+USD_TO_FCFA = 600            # 1 USD = 600 FCFA
+EUR_TO_FCFA = 655            # 1 EUR = 655 FCFA (taux fixe XOF)
+GBP_TO_FCFA = 760            # 1 GBP ≈ 760 FCFA
+CAD_TO_FCFA = 440            # 1 CAD ≈ 440 FCFA
+CHF_TO_FCFA = 660            # 1 CHF ≈ 660 FCFA
+
+# État des utilisateurs en attente d'une capture de paiement
+# Nouveau flux: étape 1 = choix du canal, étape 2 = screenshot
+# {user_id: {"step": "screenshot", "channel_id": str, "channel_name": str, ...}}
+payment_state = {}
+
+# État des demandes de bonus en attente d'approbation admin
+# {user_id: {"channel_id": str, "channel_name": str, "user_name": str}}
+bonus_state = {}
+
+# Liens d'invitation en attente de confirmation admin
+# {(cid, uid_str): invite_link_str}
+pending_invites = {}
+
+# Utilisateurs actuellement en mode assistance IA
+# {user_id: True}
+assistance_mode = {}
+
+# ═══════════════════════════════════════════════════════════════
+# GESTION DES DONNÉES
+# ═══════════════════════════════════════════════════════════════
+
+def load_data():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        data = {"channels": {}, "global_admins": ADMINS, "ai_enabled": True}
+        save_data(data)
+        return data
+    except Exception as e:
+        logger.error(f"Erreur load_data: {e}")
+        return {"channels": {}, "global_admins": ADMINS, "ai_enabled": True}
+
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def is_admin(user_id):
+    return user_id in ADMINS
+
+
+def format_time_remaining(seconds):
+    if seconds <= 0:
+        return "Expiré"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if hours >= 24:
+        days = hours // 24
+        rem = hours % 24
+        return f"{days}j {rem}h" if rem else f"{days}j"
+    elif hours > 0:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+def get_channel_data(data, channel_id):
+    cid = str(channel_id)
+    if cid not in data["channels"]:
+        data["channels"][cid] = {
+            "name": f"Canal {cid}",
+            "default_duration_hours": 24,
+            "members": {},
+            "blocked": {}
+        }
+    ch = data["channels"][cid]
+    if "blocked" not in ch:
+        ch["blocked"] = {}
+    return ch
+
+
+def format_duration_label(total_seconds: int) -> str:
+    """Formate une durée en secondes en texte lisible"""
+    if total_seconds < 3600:
+        m = total_seconds // 60
+        return f"{m} minute{'s' if m > 1 else ''}"
+    hours = total_seconds // 3600
+    if hours >= 24:
+        days = hours // 24
+        rem = hours % 24
+        return f"{days}j {rem}h" if rem else f"{days}j"
+    return f"{hours}h"
+
+
+def member_keyboard(cid: str, uid: str, default_hours: int):
+    """Clavier standard pour accorder l'accès à un membre"""
+    return [
+        [InlineKeyboardButton("⏱ 2min",  callback_data=f"grantm_{cid}_{uid}_2"),
+         InlineKeyboardButton("⏱ 10min", callback_data=f"grantm_{cid}_{uid}_10"),
+         InlineKeyboardButton("⏱ 20min", callback_data=f"grantm_{cid}_{uid}_20"),
+         InlineKeyboardButton("⏱ 30min", callback_data=f"grantm_{cid}_{uid}_30")],
+        [InlineKeyboardButton(
+            f"⏱ Défaut ({default_hours}h)",
+            callback_data=f"grant_{cid}_{uid}_{default_hours}"
+        )],
+        [InlineKeyboardButton("❌ Retirer maintenant", callback_data=f"kick_{cid}_{uid}")]
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# SERVEUR WEB KEEP-ALIVE
+# ═══════════════════════════════════════════════════════════════
+
+async def web_handler(request):
+    data = load_data()
+    total_members = sum(
+        len(ch.get("members", {}))
+        for ch in data.get("channels", {}).values()
+    )
+    channels_count = len(data.get("channels", {}))
+    ai_status = "✅ IA active" if data.get("ai_enabled", True) and gemini_client else "⭕ IA inactive"
+    return web.Response(
+        text=f"🤖 Bot Telegram Multi-Canal | {channels_count} canal(aux) | {total_members} membre(s) | {ai_status}",
+        content_type="text/html"
+    )
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', web_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌐 Serveur web démarré sur le port {PORT}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ASSISTANT IA
+# ═══════════════════════════════════════════════════════════════
+
+# Historique des conversations par utilisateur
+conversation_history = {}
+
+SYSTEM_PROMPT = """Tu es l'assistante virtuelle du développeur Sossou Kouamé Appolinaire.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IDENTITÉ
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quand on te demande "qui es-tu ?", réponds :
+"Je suis l'assistante du développeur Sossou Kouamé Appolinaire. Je suis là pour vous orienter sur le paiement, expliquer les commandes du bot et répondre à toutes vos questions sur Baccara."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANGUE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Si la langue de l'utilisateur n'est pas claire, demande-lui dans quelle langue il préfère communiquer.
+- Tu peux répondre dans TOUTES les langues du monde : français, anglais, arabe, espagnol, russe, portugais, chinois, etc.
+- Adapte-toi toujours à la langue de l'utilisateur.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TARIFS ET ACCÈS AU CANAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ABONNEMENT MENSUEL (OFFRE PRINCIPALE) :
+- 50 USD = 1 mois complet d'accès (30 jours) — c'est l'offre recommandée
+- En FCFA : 50 USD × 600 = 30 000 FCFA pour 1 mois
+
+TARIF JOURNALIER (pour les durées courtes) :
+- 1 000 FCFA = 1 jour d'accès au canal privé
+- Exemples :
+  • 1 000 FCFA → 1 jour
+  • 5 000 FCFA → 5 jours
+  • 10 000 FCFA → 10 jours
+  • 30 000 FCFA → 1 mois (30 jours)
+
+CONVERSIONS (taux automatiques du bot) :
+- 1 USD = 600 FCFA (dollar américain)
+- 1 EUR = 655 FCFA (euro — France, Europe)
+- 1 GBP = 760 FCFA (livre sterling — Royaume-Uni)
+- 1 CAD = 440 FCFA (dollar canadien)
+- 1 CHF = 660 FCFA (franc suisse)
+- 10 GNF = 1 FCFA (franc guinéen)
+
+Exemples USD :
+  • 50 USD = 30 000 FCFA → 1 mois (offre principale)
+  • 20 USD = 12 000 FCFA → 12 jours
+  • 10 USD = 6 000 FCFA → 6 jours
+  • 5 USD = 3 000 FCFA → 3 jours
+
+Exemples EUR (France) :
+  • 50 EUR = 32 750 FCFA → 32 jours
+  • 30 EUR = 19 650 FCFA → 19 jours
+  • 10 EUR = 6 550 FCFA → 6 jours
+
+APPLICATIONS DE PAIEMENT RECONNUES PAR LE BOT:
+- Europe/France: PayPal, Revolut, Wise, Lydia, Sumeria, virement bancaire
+- Afrique de l'Ouest: Wave, Orange Money, MTN Mobile Money, MoneyFusion, Free Money, Moov Money
+- USA/International: CashApp, Venmo, Zelle
+- Crypto: BNB (Binance)
+
+Quand un utilisateur demande le prix ou l'abonnement mensuel, mets TOUJOURS en avant l'offre à 50 USD/mois comme l'offre principale et la plus avantageuse.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMENT PAYER — ÉTAPES EXACTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Étape 1 : Effectue ton paiement via le moyen selon ton pays (voir section PAIEMENT).
+Étape 2 : Appuie sur le bouton 💳 "Payer mon abonnement" dans le bot (ou tape /payer).
+Étape 3 : Envoie la capture d'écran de ton paiement dans le chat.
+Étape 4 : Le bot analyse automatiquement le montant et la devise.
+Étape 5 : Choisis le canal auquel tu veux accéder.
+Étape 6 : Ton accès est activé immédiatement pour la durée calculée.
+Étape 7 : Tu recevras un message de confirmation avec la date d'expiration.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLES DE PAIEMENT PAR PAYS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. TOUJOURS demander le pays de l'utilisateur avant de donner un lien de paiement.
+2. Selon le pays :
+   - AFRIQUE (Côte d'Ivoire, Sénégal, Mali, Burkina Faso, Guinée, Cameroun, Congo, Togo, Bénin, Niger, Mauritanie, Madagascar, Gabon, etc.)
+     → Lien MoneyFusion UNIQUEMENT : https://my.moneyfusion.net/69988c55ee1fe6f8b700aa50
+     → NE JAMAIS montrer l'adresse crypto
+   - HORS AFRIQUE (Europe, Amérique, Asie, Océanie, etc.)
+     → Crypto BNB UNIQUEMENT : 0x13108641DcfaBea3b2e8dEd4d35B8f49606f5A17
+     → NE JAMAIS montrer le lien MoneyFusion
+3. EXCEPTION : Si l'utilisateur demande EXPLICITEMENT la crypto → adresse BNB : 0x13108641DcfaBea3b2e8dEd4d35B8f49606f5A17
+4. Ne jamais montrer les deux méthodes ensemble.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXPIRATION ET RENOUVELLEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Quand l'accès expire, l'utilisateur est automatiquement retiré du canal.
+- Il reçoit un message l'informant que son accès a expiré.
+- S'il tente de rejoindre le canal sans payer → il est automatiquement bloqué.
+- Pour renouveler : refaire le processus de paiement normalement (💳 → capture → canal).
+- Si bloqué par erreur, contacter l'administrateur.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMANDES DU BOT (pour les utilisateurs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/start — Affiche le menu principal avec les boutons 💬 Assistance et 💳 Payer
+/payer — Lance directement le processus de paiement par capture d'écran
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMANDES ADMINISTRATEUR (ne partager qu'avec les admins)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/channels — Liste tous les canaux gérés par le bot
+/members <id_canal> — Voir les membres actifs d'un canal
+/grant <id_canal> <id_user> <heures> — Accorder l'accès manuellement (1h à 750h)
+  Exemple : /grant -1001234567890 987654321 48  → 48h d'accès
+/remove <id_canal> <id_user> — Retirer manuellement un membre
+/unblock <id_canal> <id_user> — Débloquer un utilisateur banni
+/setduration <id_canal> <heures> — Changer la durée du bouton "Défaut"
+/scan <id_canal> — Rescanner manuellement un canal pour détecter les membres
+/ai_on — Activer l'assistant IA
+/ai_off — Désactiver l'assistant IA
+/connect — Connecter Telethon (compte personnel) pour voir tous les membres
+/telethon — Vérifier le statut de la connexion Telethon
+/help — Afficher l'aide complète
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FONCTIONNEMENT DU BOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Le bot gère l'accès temporaire à des canaux Telegram privés.
+- Quand un utilisateur rejoint un canal, l'admin reçoit une notification avec des boutons pour définir la durée : 2min / 10min / 20min / 30min / Défaut.
+- La durée peut aller de 2 minutes à 750 heures (environ 31 jours).
+- L'accès est retiré automatiquement à l'expiration, toutes les 30 secondes.
+- Le paiement par capture d'écran est analysé automatiquement par l'IA.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DOMAINE : BACCARA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Tu es experte du jeu Baccara et peux répondre à toutes les questions sur les règles, stratégies, statistiques, gestion de bankroll, etc.
+- Les canaux privés proposent des signaux et analyses pour le Baccara.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Professionnelle, chaleureuse et précise.
+- Utilise des exemples concrets avec chiffres quand l'utilisateur pose des questions sur les tarifs.
+- Ne révèle jamais les tokens, clés API ou mots de passe.
+- Pour les questions hors sujet, réponds brièvement et redirige.
+"""
+
+async def ai_reply(user_id: int, user_message: str) -> str:
+    """Génère une réponse IA pour un utilisateur"""
+    if not gemini_client:
+        return (
+            "👋 Bonjour! Je suis le bot de gestion d'accès.\n\n"
+            "Contactez un administrateur pour obtenir l'accès aux canaux privés."
+        )
+    try:
+        uid = str(user_id)
+        history = conversation_history.get(uid, [])
+
+        # Construire les messages avec l'historique
+        contents = [{"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+                    {"role": "model", "parts": [{"text": "Bien compris, je suis prêt à aider."}]}]
+        contents.extend(history)
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: gemini_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=contents
+            )
+        )
+        reply_text = response.text
+
+        # Sauvegarder l'historique (max 10 échanges)
+        history.append({"role": "user", "parts": [{"text": user_message}]})
+        history.append({"role": "model", "parts": [{"text": reply_text}]})
+        conversation_history[uid] = history[-20:]
+
+        return reply_text
+    except Exception as e:
+        logger.error(f"Erreur IA pour {user_id}: {e}")
+        return (
+            "Désolé, je n'ai pas pu traiter votre message. "
+            "Contactez un administrateur pour plus d'informations."
+        )
+
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère les messages texte en chat privé"""
+    user = update.effective_user
+    if not user:
+        return
+
+    text = update.message.text
+    if not text:
+        return
+
+    # 1. Intercepter l'auth Telethon (admin uniquement)
+    if is_admin(user.id) and user.id in telethon_manager.auth_state:
+        msg, auth_done = await telethon_manager.process_auth_step(user.id, text)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        if auth_done:
+            session_str = await telethon_manager.get_session_string()
+            await save_telethon_session(session_str, context, user.id)
+        return
+
+    # 2. Si l'utilisateur est en attente d'une capture de paiement, lui rappeler
+    if user.id in payment_state and payment_state[user.id].get("step") == "screenshot":
+        await update.message.reply_text(
+            "📸 Envoyez la **capture d'écran** de votre paiement (une image).",
+            parse_mode="Markdown"
+        )
+        return
+
+    # 3. L'IA ne répond QUE si l'utilisateur est en mode assistance
+    if user.id not in assistance_mode:
+        return  # Ignorer silencieusement — pas de réponse hors mode assistance
+
+    data = load_data()
+    if not data.get("ai_enabled", True):
+        await update.message.reply_text(
+            "L'assistant est temporairement désactivé. Contactez un administrateur."
+        )
+        return
+
+    # Indiquer que le bot est en train d'écrire
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    response = await ai_reply(user.id, text)
+
+    # Bouton "Retourner à l'accueil" après chaque réponse
+    home_keyboard = [[InlineKeyboardButton("🏠 Retourner à l'accueil", callback_data="home")]]
+
+    await update.message.reply_text(
+        response,
+        reply_markup=InlineKeyboardMarkup(home_keyboard),
+        parse_mode="Markdown"
+    )
+
+    logger.info(f"IA [assistance] répondu à {user.id}: {text[:50]}...")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ÉVÉNEMENTS : BOT AJOUTÉ/RETIRÉ D'UN CANAL
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Déclenché quand le statut du bot change dans un canal/groupe"""
+    result = update.my_chat_member
+    chat = result.chat
+    new_status = result.new_chat_member.status
+
+    if new_status in (ChatMember.ADMINISTRATOR, ChatMember.MEMBER):
+        data = load_data()
+        cid = str(chat.id)
+        ch = get_channel_data(data, chat.id)
+        ch["name"] = chat.title or f"Canal {cid}"
+        save_data(data)
+
+        logger.info(f"✅ Bot ajouté au canal: {chat.title} ({chat.id})")
+
+        for admin_id in ADMINS:
+            try:
+                keyboard = [
+                    [InlineKeyboardButton("⏱ 24h", callback_data=f"setdef_{cid}_24"),
+                     InlineKeyboardButton("⏱ 48h", callback_data=f"setdef_{cid}_48")],
+                    [InlineKeyboardButton("⏱ 7 jours", callback_data=f"setdef_{cid}_168"),
+                     InlineKeyboardButton("⏱ 30 jours", callback_data=f"setdef_{cid}_720")],
+                ]
+                await context.bot.send_message(
+                    admin_id,
+                    f"✅ **Bot ajouté au canal!**\n\n"
+                    f"📢 **Canal:** {chat.title}\n"
+                    f"🆔 **ID:** `{chat.id}`\n\n"
+                    f"⚙️ Choisissez la durée d'accès **par défaut** pour ce canal:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Erreur notif admin {admin_id}: {e}")
+
+        asyncio.create_task(scan_channel_members(context, chat.id, chat.title or cid))
+
+    elif new_status in (ChatMember.LEFT, ChatMember.BANNED):
+        data = load_data()
+        cid = str(chat.id)
+        if cid in data["channels"]:
+            del data["channels"][cid]
+            save_data(data)
+
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"⚠️ **Bot retiré du canal**\n\n"
+                    f"📢 **Canal:** {chat.title or cid}\n"
+                    f"🆔 **ID:** `{chat.id}`",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Erreur notif admin {admin_id}: {e}")
+
+
+async def scan_channel_members(context, channel_id, channel_name):
+    """Scanne les membres visibles d'un canal et envoie une fiche par membre à l'admin"""
+    await asyncio.sleep(3)
+    try:
+        bot = context.bot
+        admins = await bot.get_chat_administrators(channel_id)
+        data = load_data()
+        cid = str(channel_id)
+        ch = get_channel_data(data, channel_id)
+        existing_members = set(ch.get("members", {}).keys())
+        default_hours = ch.get("default_duration_hours", 24)
+
+        # Essayer Telethon en priorité (accès à tous les membres)
+        telethon_users = []
+        if TELETHON_API_ID and await telethon_manager.is_connected():
+            telethon_users = await telethon_manager.get_all_channel_members(channel_id)
+            logger.info(f"Telethon: {len(telethon_users)} membres trouvés dans {channel_name}")
+
+        bot_info = await bot.get_me()
+
+        if telethon_users:
+            # Utiliser les données Telethon (tous les membres)
+            members_found = [
+                u for u in telethon_users
+                if str(u.id) not in existing_members and u.id != bot_info.id
+            ]
+            source = "🔵 **Via Telethon** (liste complète des membres)"
+        else:
+            # Fallback: uniquement les admins via Bot API
+            members_found = [
+                a.user for a in admins
+                if not a.user.is_bot
+                and str(a.user.id) not in existing_members
+                and a.user.id != bot_info.id
+            ]
+            source = "🟡 **Via Bot API** (administrateurs uniquement — connectez Telethon avec /connect pour voir tous les membres)"
+
+        # Résumé initial
+        for admin_id in ADMINS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🔍 **Scan du canal: {channel_name}**\n\n"
+                    f"👥 **{len(members_found)} membre(s) détecté(s)**\n"
+                    f"{source}\n\n"
+                    + ("Fiches en cours d'envoi..." if members_found else "Aucun nouveau membre à gérer."),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+        # Envoyer une fiche individuelle par membre avec boutons de durée
+        for user in members_found:
+            full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+            username = f"@{user.username}" if user.username else "N/A"
+            uid = str(user.id)
+
+            for admin_id in ADMINS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        f"👤 **Membre détecté**\n\n"
+                        f"📢 **Canal:** {channel_name}\n"
+                        f"👤 **Nom:** {full_name}\n"
+                        f"📛 **Username:** {username}\n"
+                        f"🆔 **ID:** `{user.id}`\n\n"
+                        f"⏱ Quelle durée d'accès lui accorder?",
+                        reply_markup=InlineKeyboardMarkup(member_keyboard(cid, uid, default_hours)),
+                        parse_mode="Markdown"
+                    )
+                    await asyncio.sleep(0.5)  # Éviter le flood
+                except Exception as e:
+                    logger.error(f"Erreur fiche membre {uid}: {e}")
+
+    except Exception as e:
+        logger.error(f"Erreur scan_channel_members: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ÉVÉNEMENTS : NOUVEAU MEMBRE DANS UN CANAL
+# ═══════════════════════════════════════════════════════════════
+
+async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Déclenché quand un membre rejoint/quitte un canal géré"""
+    result = update.chat_member
+    chat = result.chat
+    new_member = result.new_chat_member
+    user = new_member.user
+
+    if user.is_bot:
+        return
+
+    cid = str(chat.id)
+    data = load_data()
+
+    if cid not in data.get("channels", {}):
+        return
+
+    if new_member.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
+        uid = str(user.id)
+        ch = get_channel_data(data, chat.id)
+
+        # Vérifier si l'utilisateur est bloqué (accès expiré précédemment)
+        if uid in ch.get("blocked", {}):
+            try:
+                await context.bot.ban_chat_member(int(cid), int(uid))
+                logger.info(f"Utilisateur bloqué {uid} a tenté de rejoindre {cid} — rejeté")
+            except Exception as e:
+                logger.error(f"Erreur ban utilisateur bloqué {uid}: {e}")
+            try:
+                await context.bot.send_message(
+                    int(uid),
+                    f"🚫 **Accès refusé — {ch['name']}**\n\n"
+                    f"Votre accès à ce canal a expiré.\n\n"
+                    f"💳 Pour renouveler votre abonnement et accéder à nouveau, "
+                    f"contactez notre assistant en appuyant sur /start",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            return
+
+        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+        username = f"@{user.username}" if user.username else "N/A"
+
+        # Vérifier si c'est un membre payant (déjà enregistré via paiement)
+        if uid in ch.get("members", {}):
+            # Membre payant — notifier l'admin avec bouton Confirmer pour révoquer le lien
+            key = (cid, uid)
+            invite_link = pending_invites.get(key, "")
+            member_info = ch["members"][uid]
+            expires_at = member_info.get("expires_at", 0)
+            dur_sec = member_info.get("duration_seconds", 0)
+            dur_label = format_duration_label(dur_sec)
+            expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M') if expires_at else "?"
+
+            confirm_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Confirmer l'intégration", callback_data=f"cjoin_{uid}_{cid}")
+            ]])
+            for admin_id in ADMINS:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"✅ **Membre intégré: {ch['name']}**\n\n"
+                        f"👤 **Nom:** {full_name}\n"
+                        f"📛 **Username:** {username}\n"
+                        f"🆔 **ID:** `{user.id}`\n"
+                        f"⏱ **Durée:** {dur_label}\n"
+                        f"📅 **Expire:** {expire_str}\n\n"
+                        f"Cliquez sur **Confirmer** pour révoquer le lien d'invitation.",
+                        reply_markup=confirm_kb,
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Erreur notif admin {admin_id}: {e}")
+        else:
+            # Membre inconnu — demander à l'admin combien de temps accorder
+            default_hours = ch.get("default_duration_hours", 24)
+            for admin_id in ADMINS:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"🆕 **Nouveau membre dans {ch['name']}**\n\n"
+                        f"👤 **Nom:** {full_name}\n"
+                        f"📛 **Username:** {username}\n"
+                        f"🆔 **ID:** `{user.id}`\n\n"
+                        f"⏱ Combien de temps lui accorder?",
+                        reply_markup=InlineKeyboardMarkup(member_keyboard(cid, uid, default_hours)),
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Erreur notif admin {admin_id}: {e}")
+
+    elif new_member.status in (ChatMember.LEFT, ChatMember.BANNED):
+        uid = str(user.id)
+        data = load_data()
+        if cid in data.get("channels", {}) and uid in data["channels"][cid].get("members", {}):
+            del data["channels"][cid]["members"][uid]
+            save_data(data)
+
+
+# ═══════════════════════════════════════════════════════════════
+# CALLBACKS (Boutons)
+# ═══════════════════════════════════════════════════════════════
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split("_")
+    action = parts[0]
+
+    # Accessible à tous les utilisateurs
+    if query.data == "assist_start":
+        user = update.effective_user
+        first_name = user.first_name or "vous"
+        # Activer le mode assistance
+        assistance_mode[user.id] = True
+        # Réinitialiser l'historique pour une nouvelle session
+        conversation_history.pop(str(user.id), None)
+
+        home_keyboard = [[InlineKeyboardButton("🏠 Retourner à l'accueil", callback_data="home")]]
+        await query.edit_message_text(
+            f"👨‍💻 **Bonjour {first_name}!**\n\n"
+            f"Je suis l'assistante du développeur **Sossou Kouamé Appolinaire**.\n"
+            f"Je suis là pour vous orienter pour le paiement et répondre à toutes vos questions sur **Baccara** et notre bot. 😊\n\n"
+            f"🌍 *In which language would you like to chat?*\n"
+            f"🌍 *¿En qué idioma deseas que hablemos?*\n"
+            f"🌍 *بأي لغة تريد أن نتحدث؟*\n"
+            f"🌍 **Dans quelle langue souhaitez-vous dialoguer ?**",
+            reply_markup=InlineKeyboardMarkup(home_keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    if query.data == "home":
+        user = update.effective_user
+        # Désactiver le mode assistance
+        assistance_mode.pop(user.id, None)
+        conversation_history.pop(str(user.id), None)
+
+        await query.edit_message_text("✅ Session terminée.")
+
+        # Afficher le menu principal
+        user_keyboard = [
+            [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
+            [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
+            [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
+        ]
+        await context.bot.send_message(
+            user.id,
+            f"🏠 **Menu principal**\n\n"
+            f"Que souhaitez-vous faire ?\n\n"
+            f"• 💳 Payer votre abonnement (**50 USD/mois** ou {PRICE_PER_DAY_FCFA} FCFA/jour)\n"
+            f"• 🎁 Demander un accès gratuit (bonus)\n"
+            f"• 💬 Contacter l'assistance",
+            reply_markup=InlineKeyboardMarkup(user_keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Callbacks accessibles à tous les utilisateurs ─────────────────
+    if query.data == "pay_start":
+        user = update.effective_user
+        data = load_data()
+        channels = data.get("channels", {})
+        if not channels:
+            await query.edit_message_text("ℹ️ Aucun canal disponible pour le moment.\nContactez un administrateur.")
+            return
+        # Si un seul canal → aller directement à la capture d'écran
+        if len(channels) == 1:
+            cid = list(channels.keys())[0]
+            ch_name = channels[cid].get("name", cid)
+            payment_state[user.id] = {"step": "screenshot", "channel_id": cid, "channel_name": ch_name}
+            await query.edit_message_text(
+                f"💳 **Paiement**\n\n"
+                f"📢 Canal: **{ch_name}**\n\n"
+                f"📸 Envoyez la **capture d'écran** de votre paiement dans ce chat.\n\n"
+                f"Le bot vérifiera automatiquement le montant et activera votre accès immédiatement.\n\n"
+                f"💵 Taux: **{PRICE_PER_DAY_FCFA} FCFA = 1 jour** | **50 USD = 1 mois**\n\n"
+                f"_Appuyez sur /annuler pour annuler._",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                f"💳 **Paiement — Étape 1/2**\n\n"
+                f"Choisissez le **canal** auquel vous souhaitez accéder:",
+                reply_markup=_build_payer_channel_keyboard(user.id, channels),
+                parse_mode="Markdown"
+            )
+        return
+
+    if action == "pch":
+        payer_uid = int(parts[1])
+        cid = "_".join(parts[2:])   # au cas où cid contiendrait un séparateur
+        if update.effective_user.id != payer_uid:
+            await query.answer("Ce bouton ne vous est pas destiné.", show_alert=True)
+            return
+        data = load_data()
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            return
+        ch_name = data["channels"][cid].get("name", cid)
+        payment_state[payer_uid] = {"step": "screenshot", "channel_id": cid, "channel_name": ch_name}
+        await query.edit_message_text(
+            f"💳 **Paiement — Étape 2/2**\n\n"
+            f"📢 Canal choisi: **{ch_name}**\n\n"
+            f"📸 Envoyez maintenant la **capture d'écran** de votre paiement dans ce chat.\n\n"
+            f"Le bot vérifiera automatiquement le montant, la devise et que le reçu n'a pas déjà été utilisé, "
+            f"puis activera votre accès immédiatement.\n\n"
+            f"💵 Taux: **{PRICE_PER_DAY_FCFA} FCFA = 1 jour** | **50 USD = 1 mois**",
+            parse_mode="Markdown"
+        )
+        return
+
+    if action == "paycancel":
+        payer_uid = int(parts[1])
+        payment_state.pop(payer_uid, None)
+        try:
+            await query.edit_message_text("❌ Paiement annulé.")
+        except Exception:
+            pass
+        return
+
+    if query.data == "bonus_start":
+        user = update.effective_user
+        data = load_data()
+        channels = data.get("channels", {})
+        if not channels:
+            await query.edit_message_text("ℹ️ Aucun canal disponible.")
+            return
+        keyboard = []
+        for cid, ch in channels.items():
+            keyboard.append([InlineKeyboardButton(f"📢 {ch.get('name', cid)}", callback_data=f"bch_{user.id}_{cid}")])
+        keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data="home")])
+        await query.edit_message_text(
+            "🎁 **Demande de bonus**\n\nPour quel canal souhaitez-vous demander un accès gratuit?\n\n"
+            "_La demande sera envoyée à l'administrateur pour approbation._",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
+    if action == "bch":
+        requester_uid = int(parts[1])
+        cid = "_".join(parts[2:])
+        if update.effective_user.id != requester_uid:
+            await query.answer("Ce bouton ne vous est pas destiné.", show_alert=True)
+            return
+        data = load_data()
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            return
+        ch_name = data["channels"][cid].get("name", cid)
+        user = update.effective_user
+        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+        username_str = f"@{user.username}" if user.username else "N/A"
+
+        bonus_state[requester_uid] = {"channel_id": cid, "channel_name": ch_name, "user_name": full_name}
+
+        await query.edit_message_text(
+            f"⏳ **Demande envoyée!**\n\n"
+            f"📢 Canal demandé: **{ch_name}**\n\n"
+            f"Votre demande a été transmise à l'administrateur.\n"
+            f"Vous serez notifié dès qu'elle sera traitée.",
+            parse_mode="Markdown"
+        )
+
+        # Notifier les admins avec boutons d'approbation
+        approve_keyboard = []
+        for h_label, h_val in [("1 jour (24h)", 24), ("3 jours (72h)", 72),
+                                 ("7 jours (168h)", 168), ("1 mois (720h)", 720)]:
+            approve_keyboard.append([InlineKeyboardButton(
+                f"✅ {h_label}", callback_data=f"bapprove_{requester_uid}_{cid}_{h_val}"
+            )])
+        approve_keyboard.append([InlineKeyboardButton("❌ Refuser", callback_data=f"bdeny_{requester_uid}_{cid}")])
+
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"🎁 **Demande de bonus reçue!**\n\n"
+                    f"👤 Utilisateur: **{full_name}** ({username_str})\n"
+                    f"🆔 ID: `{requester_uid}`\n"
+                    f"📢 Canal: **{ch_name}**\n\n"
+                    f"Choisissez la durée d'accès à accorder:",
+                    reply_markup=InlineKeyboardMarkup(approve_keyboard),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Erreur envoi notif bonus à admin {admin_id}: {e}")
+        return
+
+    if action == "cjoin":
+        # cjoin_{uid}_{cid} — Admin confirme l'intégration et révoque le lien d'invitation
+        if not is_admin(update.effective_user.id):
+            await query.answer("Réservé à l'administrateur.", show_alert=True)
+            return
+        uid = parts[1]
+        cid = "_".join(parts[2:])
+        key = (cid, uid)
+        invite_link = pending_invites.pop(key, None)
+        revoked = False
+        if invite_link:
+            try:
+                await context.bot.revoke_chat_invite_link(int(cid), invite_link)
+                revoked = True
+            except Exception as e:
+                logger.warning(f"Impossible de révoquer le lien {invite_link}: {e}")
+        data = load_data()
+        ch_name = data.get("channels", {}).get(cid, {}).get("name", cid)
+        admin_name = update.effective_user.first_name or "Admin"
+        status_line = "🔒 Lien révoqué." if revoked else "⚠️ Lien déjà expiré ou introuvable."
+        await query.edit_message_text(
+            f"✅ **Intégration confirmée par {admin_name}**\n\n"
+            f"📢 Canal: **{ch_name}**\n"
+            f"🆔 Utilisateur: `{uid}`\n"
+            f"{status_line}",
+            parse_mode="Markdown"
+        )
+        return
+
+    if action == "bapprove":
+        if not is_admin(update.effective_user.id):
+            await query.answer("Réservé à l'administrateur.", show_alert=True)
+            return
+        requester_uid = int(parts[1])
+        cid = parts[2]
+        hours = int(parts[3])
+        data = load_data()
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            return
+        ch = data["channels"][cid]
+        current_time = int(datetime.now().timestamp())
+        duration_seconds = hours * 3600
+        expires_at = current_time + duration_seconds
+        ch.setdefault("members", {})[str(requester_uid)] = {
+            "expires_at": expires_at, "granted_at": current_time, "duration_seconds": duration_seconds
+        }
+        ch.setdefault("blocked", {}).pop(str(requester_uid), None)
+        save_data(data)
+        try:
+            await context.bot.unban_chat_member(int(cid), requester_uid)
+        except Exception:
+            pass
+        bonus_state.pop(requester_uid, None)
+        dur_label = format_duration_label(duration_seconds)
+        expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
+        try:
+            await context.bot.send_message(
+                requester_uid,
+                f"🎉 **Accès bonus approuvé!**\n\n"
+                f"📢 Canal: **{ch['name']}**\n"
+                f"⏱ Durée: **{dur_label}**\n"
+                f"📅 Expire le: {expire_str}\n\n"
+                f"✅ Vous pouvez maintenant rejoindre le canal.\n"
+                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        admin_name = update.effective_user.first_name or "Admin"
+        await query.edit_message_text(
+            f"✅ **Bonus accordé par {admin_name}**\n\n"
+            f"🆔 Utilisateur: `{requester_uid}`\n"
+            f"📢 Canal: **{ch['name']}**\n"
+            f"⏱ Durée: **{dur_label}**\n"
+            f"📅 Expire le: {expire_str}",
+            parse_mode="Markdown"
+        )
+        return
+
+    if action == "bdeny":
+        if not is_admin(update.effective_user.id):
+            await query.answer("Réservé à l'administrateur.", show_alert=True)
+            return
+        requester_uid = int(parts[1])
+        cid = parts[2]
+        bonus_state.pop(requester_uid, None)
+        data = load_data()
+        ch_name = data.get("channels", {}).get(cid, {}).get("name", cid)
+        try:
+            await context.bot.send_message(
+                requester_uid,
+                f"❌ **Demande de bonus refusée**\n\n"
+                f"📢 Canal: **{ch_name}**\n\n"
+                f"Votre demande n'a pas été approuvée.\n"
+                f"Pour accéder au canal, effectuez un paiement via /payer",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        await query.edit_message_text(
+            f"❌ Demande de `{requester_uid}` refusée pour **{ch_name}**.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Toutes les actions suivantes sont réservées aux admins ─────────
+    if not is_admin(update.effective_user.id):
+        user = update.effective_user
+        user_keyboard = [
+            [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
+            [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
+            [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
+        ]
+        try:
+            await query.edit_message_text(
+                f"👋 Bonjour **{user.first_name or 'vous'}**!\n\nQue souhaitez-vous faire?",
+                reply_markup=InlineKeyboardMarkup(user_keyboard),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "setdef":
+        cid = parts[1]
+        hours = int(parts[2])
+        data = load_data()
+        if cid in data.get("channels", {}):
+            data["channels"][cid]["default_duration_hours"] = hours
+            ch_name = data["channels"][cid].get("name", cid)
+            save_data(data)
+            dur = f"{hours//24}j" if hours >= 24 else f"{hours}h"
+            await query.edit_message_text(
+                f"✅ **Durée par défaut mise à jour!**\n\n"
+                f"📢 Canal: {ch_name}\n"
+                f"⏱ Durée: {dur}",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text("❌ Canal introuvable.")
+
+    elif action in ("grant", "grantm"):
+        cid = parts[1]
+        uid = parts[2]
+        val = int(parts[3])
+        data = load_data()
+
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            return
+
+        ch = data["channels"][cid]
+        current_time = int(datetime.now().timestamp())
+
+        # "grant" = heures, "grantm" = minutes
+        duration_seconds = val * 60 if action == "grantm" else val * 3600
+        expires_at = current_time + duration_seconds
+
+        ch.setdefault("members", {})[uid] = {
+            "expires_at": expires_at,
+            "granted_at": current_time,
+            "duration_seconds": duration_seconds
+        }
+        # Débloquer l'utilisateur s'il était bloqué
+        ch.setdefault("blocked", {}).pop(uid, None)
+        save_data(data)
+
+        dur_label = format_duration_label(duration_seconds)
+        expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M:%S')
+
+        try:
+            await context.bot.send_message(
+                int(uid),
+                f"✅ **Accès accordé!**\n\n"
+                f"📢 Canal: **{ch['name']}**\n"
+                f"⏱ Durée: **{dur_label}**\n"
+                f"📅 Expire le: {expire_str}\n\n"
+                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            f"✅ **Accès accordé!**\n\n"
+            f"🆔 Utilisateur: `{uid}`\n"
+            f"⏱ Durée: **{dur_label}**\n"
+            f"📅 Expire: {expire_str}",
+            parse_mode="Markdown"
+        )
+
+    elif action == "kick":
+        cid = parts[1]
+        uid = parts[2]
+        data = load_data()
+
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            return
+
+        try:
+            await context.bot.ban_chat_member(int(cid), int(uid))
+            await context.bot.unban_chat_member(int(cid), int(uid))
+        except Exception as e:
+            logger.warning(f"Impossible de retirer {uid} du canal {cid}: {e}")
+
+        ch = data["channels"][cid]
+        ch.get("members", {}).pop(uid, None)
+        save_data(data)
+
+        try:
+            await context.bot.send_message(
+                int(uid),
+                f"⚠️ Vous avez été retiré du canal **{ch['name']}**.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        await query.edit_message_text(
+            f"✅ Utilisateur `{uid}` retiré du canal {ch['name']}.",
+            parse_mode="Markdown"
+        )
+
+    elif action == "paychan":
+        # paychan_{user_id}_{cid}
+        payer_uid = int(parts[1])
+        cid = parts[2]
+        state = payment_state.get(payer_uid, {})
+
+        if state.get("step") != "channel":
+            await query.edit_message_text("❌ Session expirée. Recommencez avec /payer")
+            return
+
+        hours = state["hours"]
+        amount_str = state["amount_str"]
+        amount_fcfa = state["amount_fcfa"]
+        photo_file_id = state.get("photo_file_id")
+
+        data = load_data()
+        if cid not in data.get("channels", {}):
+            await query.edit_message_text("❌ Canal introuvable.")
+            payment_state.pop(payer_uid, None)
+            return
+
+        ch = data["channels"][cid]
+        current_time = int(datetime.now().timestamp())
+        duration_seconds = hours * 3600
+        expires_at = current_time + duration_seconds
+
+        ch.setdefault("members", {})[str(payer_uid)] = {
+            "expires_at": expires_at,
+            "granted_at": current_time,
+            "duration_seconds": duration_seconds
+        }
+        ch.setdefault("blocked", {}).pop(str(payer_uid), None)
+        save_data(data)
+
+        dur_label = format_duration_label(duration_seconds)
+        expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
+
+        # Débloquer si banni
+        try:
+            await context.bot.unban_chat_member(int(cid), payer_uid)
+        except Exception:
+            pass
+
+        # Confirmer à l'utilisateur
+        await query.edit_message_text(
+            f"🎉 **Accès activé avec succès!**\n\n"
+            f"📢 Canal: **{ch['name']}**\n"
+            f"💰 Montant payé: **{amount_str}**\n"
+            f"⏱ Durée: **{dur_label}**\n"
+            f"📅 Expire le: {expire_str}\n\n"
+            f"✅ Vous pouvez maintenant rejoindre le canal.",
+            parse_mode="Markdown"
+        )
+
+        payment_state.pop(payer_uid, None)
+
+        # Notifier les admins
+        user = update.effective_user
+        if photo_file_id:
+            await notify_admins_payment(
+                context, user, cid, ch["name"], amount_str, hours, photo_file_id
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMMANDES ADMIN
+# ═══════════════════════════════════════════════════════════════
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if is_admin(user_id):
+        ai_status = "✅ Active" if gemini_client else "❌ Non configurée (GEMINI_API_KEY manquant)"
+        data = load_data()
+        ai_toggle = data.get("ai_enabled", True)
+        admin_keyboard = [
+            [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
+            [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
+            [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
+        ]
+        await update.message.reply_text(
+            "👋 **Bienvenue, Administrateur!**\n\n"
+            "📋 **Commandes membres:**\n"
+            "• `/channels` — Liste des canaux\n"
+            "• `/members <id_canal>` — Membres + temps restant\n"
+            "• `/extend <id_canal> <id_user> <heures>` — Rallonger l'accès\n"
+            "• `/grant <id_canal> <id_user> <heures>` — Accorder l'accès\n"
+            "• `/remove <id_canal> <id_user>` — Retirer un membre\n"
+            "• `/unblock <id_canal> <id_user>` — Débloquer\n\n"
+            "📋 **Autres commandes:**\n"
+            "• `/setduration <id_canal> <heures>` — Durée par défaut\n"
+            "• `/bonus` — Accorder accès sans paiement\n"
+            "• `/ai_on` / `/ai_off` — IA assistant\n"
+            "• `/help` — Aide complète\n\n"
+            f"🤖 **IA:** {ai_status} | **Activée:** {'Oui' if ai_toggle else 'Non'}",
+            reply_markup=InlineKeyboardMarkup(admin_keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        user_keyboard = [
+            [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
+            [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
+            [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
+        ]
+        await update.message.reply_text(
+            "👋 **Bienvenue!**\n\n"
+            f"• 💳 Abonnement mensuel: **50 USD / mois**\n"
+            f"• 💵 Ou: **{PRICE_PER_DAY_FCFA} FCFA / jour**\n"
+            f"• 🎁 Vous pouvez demander un accès gratuit (bonus)\n"
+            f"• 💬 Contacter l'assistance",
+            reply_markup=InlineKeyboardMarkup(user_keyboard),
+            parse_mode="Markdown"
+        )
+
+
+async def ai_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+    data = load_data()
+    data["ai_enabled"] = True
+    save_data(data)
+    status = "✅ opérationnel" if gemini_client else "⚠️ activé mais GEMINI_API_KEY non configuré"
+    await update.message.reply_text(f"🤖 **Assistant IA {status}!**\n\nIl répondra automatiquement aux utilisateurs.", parse_mode="Markdown")
+
+
+async def ai_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+    data = load_data()
+    data["ai_enabled"] = False
+    save_data(data)
+    await update.message.reply_text("⭕ **Assistant IA désactivé.**\n\nLe bot ne répondra plus automatiquement.", parse_mode="Markdown")
+
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    data = load_data()
+    channels = data.get("channels", {})
+
+    if not channels:
+        await update.message.reply_text(
+            "📋 Aucun canal géré.\n\n"
+            "➕ Ajoutez le bot comme administrateur d'un canal pour commencer."
+        )
+        return
+
+    current_time = int(datetime.now().timestamp())
+    msg = "📋 **Canaux gérés:**\n\n"
+
+    for cid, ch in channels.items():
+        members = ch.get("members", {})
+        active = sum(1 for m in members.values() if m.get("expires_at", 0) > current_time)
+        expired = len(members) - active
+        default_h = ch.get("default_duration_hours", 24)
+        msg += (
+            f"📢 **{ch.get('name', cid)}**\n"
+            f"   🆔 `{cid}`\n"
+            f"   👥 {active} actif(s) | 🔴 {expired} expiré(s)\n"
+            f"   ⏱ Défaut: {default_h}h\n\n"
+        )
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/members <id_canal>`", parse_mode="Markdown")
+        return
+
+    cid = context.args[0]
+    data = load_data()
+
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    ch = data["channels"][cid]
+    members = ch.get("members", {})
+    current_time = int(datetime.now().timestamp())
+
+    if not members:
+        await update.message.reply_text(f"📋 Aucun membre dans **{ch['name']}**.", parse_mode="Markdown")
+        return
+
+    msg = f"📋 **Membres — {ch['name']}**\n\n"
+    for uid, m in members.items():
+        time_left = m.get("expires_at", 0) - current_time
+        status = "🟢" if time_left > 0 else "🔴"
+        msg += f"{status} `{uid}` — ⏳ {format_time_remaining(time_left)}\n"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/remove <id_canal> <id_user>`", parse_mode="Markdown")
+        return
+
+    cid, uid = context.args[0], context.args[1]
+    data = load_data()
+
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    ch = data["channels"][cid]
+    try:
+        await context.bot.ban_chat_member(int(cid), int(uid))
+        await context.bot.unban_chat_member(int(cid), int(uid))
+    except Exception as e:
+        logger.warning(f"Impossible de retirer {uid}: {e}")
+
+    ch.get("members", {}).pop(uid, None)
+    save_data(data)
+
+    try:
+        await context.bot.send_message(int(uid), f"⚠️ Votre accès au canal **{ch['name']}** a été révoqué.", parse_mode="Markdown")
+    except Exception:
+        pass
+
+    await update.message.reply_text(f"✅ Utilisateur `{uid}` retiré de **{ch['name']}**.", parse_mode="Markdown")
+
+
+async def setduration_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/setduration <id_canal> <heures>`\n"
+            "Exemple: `/setduration -1001234567890 24`\n"
+            "_Définit la durée par défaut du bouton Défaut._",
+            parse_mode="Markdown"
+        )
+        return
+
+    cid = context.args[0]
+    try:
+        hours = int(context.args[1])
+        if not (1 <= hours <= 750):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Durée invalide. Entrez un nombre entre 1 et 750.")
+        return
+
+    data = load_data()
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    data["channels"][cid]["default_duration_hours"] = hours
+    save_data(data)
+    await update.message.reply_text(
+        f"✅ Durée par défaut mise à jour: **{hours}h** pour **{data['channels'][cid]['name']}**",
+        parse_mode="Markdown"
+    )
+
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Accorder l'accès par commande — durée en heures (1h à 750h)"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ Usage: `/grant <id_canal> <id_user> <heures>`\n"
+            "Exemple: `/grant -1001234567890 987654321 48`\n"
+            "_Durée: 1h minimum, 750h maximum_",
+            parse_mode="Markdown"
+        )
+        return
+
+    cid = context.args[0]
+    uid = context.args[1]
+    try:
+        hours = int(context.args[2])
+        if not (1 <= hours <= 750):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Durée invalide. Entrez un nombre entre 1 et 750.")
+        return
+
+    data = load_data()
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    ch = data["channels"][cid]
+    current_time = int(datetime.now().timestamp())
+    duration_seconds = hours * 3600
+    expires_at = current_time + duration_seconds
+
+    ch.setdefault("members", {})[uid] = {
+        "expires_at": expires_at,
+        "granted_at": current_time,
+        "duration_seconds": duration_seconds
+    }
+    ch.setdefault("blocked", {}).pop(uid, None)
+    save_data(data)
+
+    dur_label = format_duration_label(duration_seconds)
+    expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
+
+    try:
+        await context.bot.send_message(
+            int(uid),
+            f"✅ **Accès accordé!**\n\n"
+            f"📢 Canal: **{ch['name']}**\n"
+            f"⏱ Durée: **{dur_label}**\n"
+            f"📅 Expire le: {expire_str}\n\n"
+            f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        f"✅ **Accès accordé par commande!**\n\n"
+        f"📢 Canal: {ch['name']}\n"
+        f"🆔 Utilisateur: `{uid}`\n"
+        f"⏱ Durée: **{dur_label}**\n"
+        f"📅 Expire: {expire_str}",
+        parse_mode="Markdown"
+    )
+
+
+async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Débloquer un utilisateur précédemment bloqué"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Usage: `/unblock <id_canal> <id_user>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    cid = context.args[0]
+    uid = context.args[1]
+    data = load_data()
+
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    ch = data["channels"][cid]
+    if uid in ch.get("blocked", {}):
+        del ch["blocked"][uid]
+        # Unban pour lui permettre de rejoindre
+        try:
+            await context.bot.unban_chat_member(int(cid), int(uid))
+        except Exception:
+            pass
+        save_data(data)
+        await update.message.reply_text(
+            f"✅ Utilisateur `{uid}` débloqué.\n"
+            f"Il peut maintenant rejoindre **{ch['name']}**.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"ℹ️ L'utilisateur `{uid}` n'est pas bloqué.", parse_mode="Markdown")
+
+
+async def extend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rallonger la durée d'accès d'un membre existant"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ Usage: `/extend <id_canal> <id_user> <heures>`\n"
+            "Exemple: `/extend -1001234567890 987654321 24`\n"
+            "_Ajoute des heures à l'accès existant d'un membre._",
+            parse_mode="Markdown"
+        )
+        return
+
+    cid = context.args[0]
+    uid = context.args[1]
+    try:
+        extra_hours = int(context.args[2])
+        if not (1 <= extra_hours <= 750):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Durée invalide. Entrez un nombre entre 1 et 750.")
+        return
+
+    data = load_data()
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal introuvable.")
+        return
+
+    ch = data["channels"][cid]
+    members = ch.setdefault("members", {})
+    current_time = int(datetime.now().timestamp())
+
+    if uid in members:
+        current_expiry = members[uid].get("expires_at", current_time)
+        # Si déjà expiré, on part de maintenant; sinon on rallonge depuis l'expiration actuelle
+        base_time = max(current_expiry, current_time)
+        new_expiry = base_time + (extra_hours * 3600)
+        members[uid]["expires_at"] = new_expiry
+        members[uid].setdefault("duration_seconds", extra_hours * 3600)
+    else:
+        # Nouveau membre
+        new_expiry = current_time + (extra_hours * 3600)
+        members[uid] = {
+            "expires_at": new_expiry,
+            "granted_at": current_time,
+            "duration_seconds": extra_hours * 3600
+        }
+
+    ch.setdefault("blocked", {}).pop(uid, None)
+    save_data(data)
+
+    expire_str = datetime.fromtimestamp(new_expiry).strftime('%d/%m/%Y à %H:%M')
+
+    try:
+        await context.bot.unban_chat_member(int(cid), int(uid))
+    except Exception:
+        pass
+
+    try:
+        await context.bot.send_message(
+            int(uid),
+            f"✅ **Accès prolongé!**\n\n"
+            f"📢 Canal: **{ch['name']}**\n"
+            f"➕ **+{extra_hours}h** ajoutées\n"
+            f"📅 Nouveau terme: {expire_str}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        f"✅ **Accès prolongé de +{extra_hours}h**\n\n"
+        f"🆔 Utilisateur: `{uid}`\n"
+        f"📢 Canal: **{ch['name']}**\n"
+        f"📅 Expire maintenant le: {expire_str}",
+        parse_mode="Markdown"
+    )
+
+
+async def bonus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /bonus — demander un accès sans paiement (envoi notification admin)"""
+    user = update.effective_user
+    if not user:
+        return
+
+    data = load_data()
+    channels = data.get("channels", {})
+    if not channels:
+        await update.message.reply_text("ℹ️ Aucun canal disponible pour le moment.")
+        return
+
+    keyboard = []
+    for cid, ch in channels.items():
+        keyboard.append([InlineKeyboardButton(
+            f"📢 {ch.get('name', cid)}",
+            callback_data=f"bch_{user.id}_{cid}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data="home")])
+
+    await update.message.reply_text(
+        "🎁 **Demande de bonus**\n\n"
+        "Pour quel canal souhaitez-vous demander un accès gratuit?\n\n"
+        "_Votre demande sera envoyée à l'administrateur pour approbation._",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        text = (
+            "📖 **Aide — Commandes Admin**\n\n"
+            "**Canaux:**\n"
+            "• `/channels` — Liste des canaux gérés\n"
+            "• `/members <id_canal>` — Membres + temps restant\n"
+            "• `/remove <id_canal> <id_user>` — Retirer un membre\n\n"
+            "**Durées d'accès:**\n"
+            "• **Boutons** (nouveau membre): 2min / 10min / 20min / 30min / Défaut\n"
+            "• `/grant <id_canal> <id_user> <heures>` — Accorder 1h à 750h\n"
+            "• `/extend <id_canal> <id_user> <heures>` — **Rallonger** l'accès existant\n"
+            "• `/setduration <id_canal> <heures>` — Durée du bouton Défaut\n"
+            "• `/unblock <id_canal> <id_user>` — Débloquer un banni\n"
+            "• `/bonus` — Accorder accès gratuit (envoie notif à vous-même)\n\n"
+            "**Paiements:**\n"
+            "• Anti-doublon automatique (hash du reçu vérifié)\n"
+            "• Références de transaction extraites et stockées\n\n"
+            "**Expiration:**\n"
+            "• Retrait immédiat à expiration\n"
+            "• Retour tenté → blocage auto + message\n\n"
+            "**Assistant IA:**\n"
+            "• `/ai_on` / `/ai_off` — Activer/désactiver\n\n"
+            "**Telethon:**\n"
+            "• `/connect [+numéro]` — Connecter compte Telegram\n"
+            "• `/telethon` — Statut connexion\n"
+            "• `/scan <id_canal>` — Rescanner un canal\n"
+            "• `/disconnect` — Déconnecter"
+        )
+    else:
+        text = (
+            "📖 **Aide**\n\n"
+            "• `/payer` — Payer et accéder à un canal\n"
+            "• `/bonus` — Demander un accès gratuit\n"
+            "• `/start` — Menu principal"
+        )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════
+# SYSTÈME DE PAIEMENT PAR CAPTURE D'ÉCRAN
+# ═══════════════════════════════════════════════════════════════
+
+def _parse_amount_robust(value) -> float:
+    """Convertit une valeur montant en float, gère virgule européenne et espaces."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    # Format européen: "1 234,56" ou "1.234,56" → enlever séparateurs de milliers
+    # Détecter si la virgule est décimale (format européen) ou le point
+    s = s.replace(" ", "").replace("\u00a0", "")  # espaces insécables
+    if "," in s and "." in s:
+        # Ex: "1.234,56" → virgule = décimale
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        # Ex: "50,00" → virgule = décimale (format français)
+        s = s.replace(",", ".")
+    # Supprimer tout caractère non numérique sauf le point
+    import re as _re
+    s = _re.sub(r"[^\d.]", "", s)
+    return float(s) if s else 0.0
+
+
+CURRENCY_TABLE = {
+    # Franc CFA et variantes
+    "XOF": ("FCFA", 1.0),
+    "FCFA": ("FCFA", 1.0),
+    "CFA": ("FCFA", 1.0),
+    "XAF": ("FCFA", 1.0),
+    # Dollar américain
+    "USD": ("USD", USD_TO_FCFA),
+    "$": ("USD", USD_TO_FCFA),
+    "US$": ("USD", USD_TO_FCFA),
+    # Euro (France, Europe)
+    "EUR": ("EUR", EUR_TO_FCFA),
+    "€": ("EUR", EUR_TO_FCFA),
+    # Livre sterling
+    "GBP": ("GBP", GBP_TO_FCFA),
+    "£": ("GBP", GBP_TO_FCFA),
+    # Dollar canadien
+    "CAD": ("CAD", CAD_TO_FCFA),
+    "CA$": ("CAD", CAD_TO_FCFA),
+    # Franc suisse
+    "CHF": ("CHF", CHF_TO_FCFA),
+    # Franc guinéen
+    "GNF": ("GNF", 0.1),
+    # Franc congolais
+    "CDF": ("CDF", 0.0003),
+    # Stablecoins (1 USD ≈ 600 FCFA)
+    "USDT": ("USDT", USD_TO_FCFA),
+    "USDC": ("USDC", USD_TO_FCFA),
+    "BUSD": ("BUSD", USD_TO_FCFA),
+    "DAI":  ("DAI",  USD_TO_FCFA),
+}
+
+# Taux de repli pour les cryptos (mis à jour si CoinGecko répond)
+CRYPTO_FALLBACK_FCFA = {
+    "BNB":  228000,
+    "ETH":  1_200_000,
+    "BTC":  48_000_000,
+    "TRX":  60,
+    "SOL":  90_000,
+    "MATIC": 360,
+    "ADA":  360,
+    "DOGE": 60,
+    "XRP":  360,
+    "LTC":  30_000,
+}
+
+# Map symbole → ID CoinGecko
+COINGECKO_IDS = {
+    "BNB":  "binancecoin",
+    "ETH":  "ethereum",
+    "BTC":  "bitcoin",
+    "TRX":  "tron",
+    "SOL":  "solana",
+    "MATIC": "matic-network",
+    "ADA":  "cardano",
+    "DOGE": "dogecoin",
+    "XRP":  "ripple",
+    "LTC":  "litecoin",
+}
+
+# Cache des prix crypto (symbol → (rate_fcfa, timestamp))
+_crypto_cache: dict = {}
+
+
+async def _get_crypto_rate_fcfa(symbol: str) -> float:
+    """Récupère le taux XOF d'une crypto via CoinGecko (cache 30 min)."""
+    import time as _time
+    import aiohttp as _aiohttp
+
+    symbol = symbol.upper()
+    cached = _crypto_cache.get(symbol)
+    if cached and _time.time() - cached[1] < 1800:
+        return cached[0]
+
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        return float(CRYPTO_FALLBACK_FCFA.get(symbol, 600))
+
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+        async with _aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=_aiohttp.ClientTimeout(total=8)) as resp:
+                data = await resp.json(content_type=None)
+        price_usd = float(data[coin_id]["usd"])
+        rate = price_usd * USD_TO_FCFA
+        _crypto_cache[symbol] = (rate, _time.time())
+        logger.info(f"CoinGecko: 1 {symbol} = ${price_usd} = {rate:,.0f} FCFA")
+        return rate
+    except Exception as e:
+        logger.warning(f"CoinGecko erreur pour {symbol}: {e} — fallback utilisé")
+        return float(CRYPTO_FALLBACK_FCFA.get(symbol, 600))
+
+
+OCR_API_KEY = "K86527928888957"
+
+
+async def _ocr_extract_text(image_bytes: bytes) -> str:
+    """Extrait le texte d'une image via l'API OCR.space — multilingue automatique."""
+    import base64 as _b64
+    import aiohttp as _aiohttp
+
+    b64 = _b64.b64encode(image_bytes).decode()
+    payload = {
+        "apikey": OCR_API_KEY,
+        "language": "auto",
+        "isOverlayRequired": "false",
+        "base64Image": f"data:image/jpeg;base64,{b64}",
+        "OCREngine": "2",
+        "scale": "true",
+        "detectOrientation": "true"
+    }
+    url = "https://api.ocr.space/parse/image"
+    async with _aiohttp.ClientSession() as session:
+        async with session.post(url, data=payload, timeout=_aiohttp.ClientTimeout(total=30)) as resp:
+            result = await resp.json(content_type=None)
+    if result.get("ParsedResults"):
+        return result["ParsedResults"][0].get("ParsedText", "")
+    logger.warning(f"OCR.space: pas de résultat — {result.get('ErrorMessage', '')}")
+    return ""
+
+
+def _parse_payment_text(text: str) -> dict:
+    """Parse le texte OCR pour extraire montant, devise, référence et application."""
+    import re as _re
+
+    t = text.upper()
+
+    # ── Détecter l'application de paiement (multilingue) ───────────────
+    app_map = {
+        # Crypto exchanges
+        "BINANCE": "Binance", "TRUST WALLET": "Trust Wallet", "TRUSTWALLET": "Trust Wallet",
+        "COINBASE": "Coinbase", "KUCOIN": "KuCoin", "BYBIT": "Bybit",
+        "CRYPTO.COM": "Crypto.com", "METAMASK": "MetaMask",
+        # Mobile money Afrique
+        "WAVE": "Wave", "ORANGE MONEY": "Orange Money", "MTN MONEY": "MTN Money",
+        "MONEYFUSION": "MoneyFusion", "MONEY FUSION": "MoneyFusion",
+        "MOOV": "Moov Money", "FLOOZ": "Flooz", "AIRTEL": "Airtel Money",
+        "TMONEY": "T-Money", "FREE MONEY": "Free Money", "YUP": "Yup",
+        # International
+        "PAYPAL": "PayPal", "REVOLUT": "Revolut", "WISE": "Wise",
+        "CASHAPP": "CashApp", "CASH APP": "CashApp", "VENMO": "Venmo",
+        "LYDIA": "Lydia", "SUMERIA": "Sumeria",
+    }
+    app_name = "Inconnu"
+    for kw, name in app_map.items():
+        if kw in t:
+            app_name = name
+            break
+
+    # Liste des symboles crypto supportés
+    _CRYPTO = r'(BNB|ETH|BTC|TRX|USDT|USDC|BUSD|DAI|SOL|MATIC|ADA|DOGE|XRP|LTC)'
+
+    # ── Détecter montant + devise ───────────────────────────────────────
+    # Chaque pattern: (regex, groupe_montant, devise_fixe_ou_None)
+    patterns = [
+        # ── Crypto ──
+        # Ex: "Сумма : 0.04 BNB" / "Amount 0.04 BNB" / "-0.03999 BNB"
+        # Mot-clé multilingue (montant / amount / сумма / итого / total / sum / сумм)
+        (r'(?:MONTANT|AMOUNT|СУММА|ИТОГО|TOTAL|SUM|SOMME)[:\s*]+[-]?(\d+[.,]\d+)\s*' + _CRYPTO, 1, None),
+        # Valeur crypto directe avec signe optionnel
+        (r'[-]?(\d+[.,]\d{1,8})\s*' + _CRYPTO, 1, None),
+        # ── Fiat avec devise explicite ──
+        # FCFA/XOF/GNF/CDF — gère decimaux et séparateurs milliers
+        (r'((?:\d{1,3}(?:[\s\xa0]\d{3})+|\d+)(?:[.,]\d{1,3})?)\s*(FCFA|XOF|GNF|CDF)', 1, None),
+        # Stablecoins (priorité sur USD pour USDT/USDC)
+        (r'(\d+[.,]\d{1,4})\s*(USDT|USDC|BUSD|DAI)', 1, None),
+        # USD: $50.00 ou 50.00 USD
+        (r'\$\s*(\d+[.,]\d{1,2})', 1, 'USD'),
+        (r'(\d+[.,]\d{1,2})\s*USD', 1, 'USD'),
+        # EUR: €50,00 ou 50,00 EUR
+        (r'€\s*(\d+[.,]\d{1,2})', 1, 'EUR'),
+        (r'(\d+[.,]\d{1,2})\s*EUR', 1, 'EUR'),
+        # GBP: £50.00 ou 50.00 GBP
+        (r'£\s*(\d+[.,]\d{1,2})', 1, 'GBP'),
+        (r'(\d+[.,]\d{1,2})\s*GBP', 1, 'GBP'),
+        # CAD: 50.00 CAD
+        (r'CA\$\s*(\d+[.,]\d{1,2})', 1, 'CAD'),
+        (r'(\d+[.,]\d{1,2})\s*CAD', 1, 'CAD'),
+        # CHF
+        (r'(\d+[.,]\d{1,2})\s*CHF', 1, 'CHF'),
+        # ── Fallback ──
+        # Mot-clé montant + nombre décimal seul → FCFA
+        (r'(?:MONTANT|AMOUNT|СУММА|ИТОГО|TOTAL|SUM)[:\s]+(\d+[.,]\d{1,3})', 1, 'XOF'),
+        (r'(\d+[.,]\d{1,3})', 1, 'XOF'),
+    ]
+
+    montant = 0.0
+    devise_raw = "XOF"
+    for pat, grp, forced_devise in patterns:
+        m = _re.search(pat, t)
+        if m:
+            try:
+                raw_num = m.group(grp).replace(' ', '').replace('\xa0', '').replace(',', '.')
+                val = float(raw_num)
+                if val > 0:
+                    montant = val
+                    devise_raw = forced_devise if forced_devise else m.group(grp + 1).strip()
+                    break
+            except (ValueError, IndexError):
+                continue
+
+    # ── Détecter la référence / Txid (multilingue) ─────────────────────
+    ref_patterns = [
+        # Hash crypto Ethereum-style (0x...) — Txid Binance, BSC, ETH
+        r'(?:TXID|TX\s*ID|HASH)[:\s]*([0-9A-F]{10,})',
+        r'\b(0[Xx][0-9A-Fa-f]{20,})\b',
+        # Référence alphanumérique standard
+        r'(?:R[ÉE]F[.:\s]+|REFERENCE[:\s]+|TRANSACTION\s*(?:ID)?[:\s]+|'
+        r'ORDER\s*ID[:\s]+|N[°O][:\s]*|FACT[:\s]*)([A-Z0-9\-]{6,40})',
+        # Motifs courants russe (Binance)
+        r'(?:TXID|ИДЕНТИФИКАТОР)[:\s]*([0-9A-F]{10,})',
+        # ID numérique long
+        r'\b([0-9]{10,20})\b',
+    ]
+    reference = ""
+    for rp in ref_patterns:
+        rm = _re.search(rp, t)
+        if rm:
+            reference = rm.group(1).strip()
+            break
+
+    return {"montant": montant, "devise_raw": devise_raw, "app": app_name, "reference": reference}
+
+
+async def analyze_payment_screenshot(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+    """
+    Analyse une capture d'écran de paiement via OCR.space + parsing regex.
+    Compatible: Binance, Trust Wallet, PayPal, Revolut, Wise, Wave, Orange Money, MTN, etc.
+    Gère: BNB, ETH, BTC, TRX, USDT, USDC + USD, EUR, GBP, CAD, CHF, XOF/FCFA, GNF.
+    Multilingue: français, anglais, russe, arabe, etc. (OCR.space auto-detect).
+    """
+    import hashlib as _hashlib
+
+    # ── Étape 1: extraction OCR ────────────────────────────────────────
+    try:
+        raw_text = await _ocr_extract_text(image_bytes)
+    except Exception as e:
+        logger.error(f"OCR.space erreur: {e}")
+        return {"success": False, "details": "Service OCR indisponible. Réessayez dans quelques secondes."}
+
+    if not raw_text.strip():
+        return {"success": False, "details": "Aucun texte détecté sur la capture. L'image est peut-être floue ou mal cadrée."}
+
+    logger.info(f"OCR extrait: {raw_text[:300]}")
+
+    # ── Étape 2: parsing du texte ──────────────────────────────────────
+    parsed = _parse_payment_text(raw_text)
+    montant = parsed["montant"]
+    devise_raw = parsed["devise_raw"]
+    app_name = parsed["app"]
+    reference = parsed["reference"]
+
+    if montant <= 0:
+        return {
+            "success": False,
+            "details": f"Montant introuvable sur la capture.\n_Texte lu:_ `{raw_text[:150].strip()}`"
+        }
+
+    # ── Étape 3: conversion en FCFA ────────────────────────────────────
+    _CRYPTO_SYMBOLS = set(CRYPTO_FALLBACK_FCFA.keys()) | {"USDT", "USDC", "BUSD", "DAI"}
+
+    if devise_raw in _CRYPTO_SYMBOLS:
+        # Crypto → récupérer le prix live depuis CoinGecko
+        rate = await _get_crypto_rate_fcfa(devise_raw)
+        devise_label = devise_raw
+        amount_fcfa = int(montant * rate)
+        crypto_price_str = f"1 {devise_raw} ≈ {rate:,.0f} FCFA"
+        amount_str = f"{montant:.6g} {devise_label} → {amount_fcfa:,} FCFA\n💱 _{crypto_price_str}_"
+    elif devise_raw in CURRENCY_TABLE:
+        devise_label, rate = CURRENCY_TABLE[devise_raw]
+        amount_fcfa = int(montant * rate)
+        if devise_raw in ("XOF", "FCFA", "CFA", "XAF"):
+            devise_label = "FCFA"
+            amount_str = f"{amount_fcfa:,} FCFA"
+        else:
+            amount_str = f"{montant:.2f} {devise_label} → {amount_fcfa:,} FCFA"
+    else:
+        devise_label = devise_raw
+        amount_fcfa = int(montant)
+        amount_str = f"{amount_fcfa:,} FCFA"
+        logger.warning(f"Devise inconnue '{devise_raw}' → traitée comme FCFA")
+
+    days = amount_fcfa / PRICE_PER_DAY_FCFA
+    hours = int(days * 24)
+
+    # ── Étape 4: hash anti-doublon ─────────────────────────────────────
+    hash_input = f"{montant:.2f}|{devise_raw}|{reference}|{app_name}".lower()
+    payment_hash = _hashlib.sha256(hash_input.encode()).hexdigest()[:24]
+
+    return {
+        "success": True,
+        "montant_brut": montant,
+        "devise": devise_label,
+        "devise_raw": devise_raw,
+        "amount_fcfa": amount_fcfa,
+        "amount_str": amount_str,
+        "days": days,
+        "hours": hours,
+        "app": app_name,
+        "reference": reference,
+        "payment_hash": payment_hash,
+        "description": f"Paiement de {amount_str} via {app_name}",
+        "raw_text": raw_text[:400]
+    }
+
+
+def _build_payer_channel_keyboard(user_id: int, channels: dict) -> InlineKeyboardMarkup:
+    """Construit le clavier de sélection de canal pour le paiement."""
+    keyboard = []
+    for cid, ch in channels.items():
+        keyboard.append([InlineKeyboardButton(
+            f"📢 {ch.get('name', cid)}",
+            callback_data=f"pch_{user_id}_{cid}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Annuler", callback_data=f"paycancel_{user_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def payer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /payer — étape 1: choisir le canal (ou direct si 1 seul), puis envoyer la capture"""
+    user = update.effective_user
+    if not user:
+        return
+
+    data = load_data()
+    channels = data.get("channels", {})
+    if not channels:
+        await update.message.reply_text(
+            "ℹ️ Aucun canal disponible pour le moment.\nContactez un administrateur."
+        )
+        return
+
+    if len(channels) == 1:
+        cid = list(channels.keys())[0]
+        ch_name = channels[cid].get("name", cid)
+        payment_state[user.id] = {"step": "screenshot", "channel_id": cid, "channel_name": ch_name}
+        await update.message.reply_text(
+            f"💳 **Paiement**\n\n"
+            f"📢 Canal: **{ch_name}**\n\n"
+            f"📸 Envoyez la **capture d'écran** de votre paiement dans ce chat.\n\n"
+            f"Le bot vérifiera automatiquement le montant et activera votre accès immédiatement.\n\n"
+            f"💵 Taux: **{PRICE_PER_DAY_FCFA} FCFA = 1 jour** | **50 USD = 1 mois**\n\n"
+            f"_Tapez /annuler pour annuler._",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"💳 **Paiement — Étape 1/2**\n\n"
+            f"Choisissez le **canal** auquel vous souhaitez accéder:",
+            reply_markup=_build_payer_channel_keyboard(user.id, channels),
+            parse_mode="Markdown"
+        )
+
+
+async def annuler_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /annuler — annule le paiement en cours"""
+    user = update.effective_user
+    if not user:
+        return
+    if user.id in payment_state:
+        payment_state.pop(user.id)
+        await update.message.reply_text("❌ Paiement annulé.")
+    else:
+        await update.message.reply_text("ℹ️ Aucun paiement en cours à annuler.")
+
+
+async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Traite la capture d'écran de paiement envoyée par l'utilisateur"""
+    user = update.effective_user
+    if not user:
+        return
+
+    state = payment_state.get(user.id, {})
+    if state.get("step") != "screenshot":
+        return  # Pas en mode paiement — ignorer
+
+    cid = state.get("channel_id")
+    ch_name = state.get("channel_name", "Canal")
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    await update.message.reply_text(
+        f"🔍 Analyse du paiement pour **{ch_name}** en cours...",
+        parse_mode="Markdown"
+    )
+
+    # Télécharger la photo
+    photo = update.message.photo[-1]
+    photo_file = await context.bot.get_file(photo.file_id)
+    image_bytes = await photo_file.download_as_bytearray()
+
+    # Analyser avec Gemini Vision
+    try:
+        result = await analyze_payment_screenshot(bytes(image_bytes))
+    except Exception as e:
+        error_str = str(e)
+        payment_state.pop(user.id, None)
+        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            await update.message.reply_text(
+                "⚠️ **Service temporairement indisponible**\n\n"
+                "Le service d'analyse est momentanément saturé. "
+                "Veuillez réessayer dans quelques minutes.\n\n"
+                "Si le problème persiste, contactez l'administrateur.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "❌ **Erreur lors de l'analyse**\n\n"
+                "Une erreur inattendue s'est produite. Veuillez réessayer ou contacter l'administrateur.",
+                parse_mode="Markdown"
+            )
+        logger.error(f"Erreur handle_payment_photo pour user {user.id}: {e}")
+        return
+
+    if not result["success"]:
+        await update.message.reply_text(
+            f"❌ **Impossible de traiter la capture**\n\n"
+            f"{result.get('details', 'Montant non détecté.')}\n\n"
+            f"Assurez-vous que la capture montre clairement le montant payé et réessayez.",
+            parse_mode="Markdown"
+        )
+        payment_state.pop(user.id, None)
+        return
+
+    amount_fcfa = result["amount_fcfa"]
+    hours = result["hours"]
+    days_text = format_duration_label(hours * 3600)
+    payment_hash = result.get("payment_hash", "")
+    reference = result.get("reference", "")
+
+    # ── Vérification anti-doublon ──────────────────────────────────────
+    data = load_data()
+    used_payments = data.setdefault("used_payments", {})
+    used_references = data.setdefault("used_references", {})
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+
+    # Chercher le doublon: par hash global OU par référence/txid seule
+    prev = None
+    dup_reason = ""
+    if payment_hash and payment_hash in used_payments:
+        prev = used_payments[payment_hash]
+        dup_reason = "hash"
+    elif reference and reference in used_references:
+        prev = used_references[reference]
+        dup_reason = f"référence `{reference}`"
+
+    if prev:
+        await update.message.reply_text(
+            f"🚫 **Reçu déjà utilisé !**\n\n"
+            f"Ce reçu de paiement a déjà été enregistré le **{prev.get('date', '?')}**.\n\n"
+            f"Si vous pensez qu'il y a une erreur, contactez l'administrateur via /start",
+            parse_mode="Markdown"
+        )
+        payment_state.pop(user.id, None)
+        # Notifier l'admin
+        for admin_id in ADMINS:
+            try:
+                await context.bot.send_photo(
+                    admin_id,
+                    photo=photo.file_id,
+                    caption=(
+                        f"⚠️ **Tentative de doublon détectée !**\n\n"
+                        f"👤 Utilisateur: **{full_name}** (@{user.username or 'N/A'})\n"
+                        f"🆔 ID: `{user.id}`\n"
+                        f"💰 Montant: {result['amount_str']}\n"
+                        f"🔍 Détecté via: {dup_reason}\n"
+                        f"📅 Précédent: {prev.get('date', '?')} — user `{prev.get('user_id', '?')}`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        return
+
+    # ── Montant insuffisant ────────────────────────────────────────────
+    if hours < 1:
+        await update.message.reply_text(
+            f"⚠️ **Montant insuffisant**\n\n"
+            f"💰 Montant détecté: {result['amount_str']}\n"
+            f"💵 Minimum requis: **{PRICE_PER_DAY_FCFA} FCFA** (1 jour)\n\n"
+            f"Contactez un administrateur si vous pensez qu'il y a une erreur.",
+            parse_mode="Markdown"
+        )
+        payment_state.pop(user.id, None)
+        return
+
+    # ── Vérifier que le canal existe toujours ─────────────────────────
+    if not cid or cid not in data.get("channels", {}):
+        await update.message.reply_text(
+            "❌ Canal introuvable. Recommencez avec /payer",
+            parse_mode="Markdown"
+        )
+        payment_state.pop(user.id, None)
+        return
+
+    ch = data["channels"][cid]
+    current_time = int(datetime.now().timestamp())
+    duration_seconds = hours * 3600
+    expires_at = current_time + duration_seconds
+
+    # Enregistrer le membre
+    ch.setdefault("members", {})[str(user.id)] = {
+        "expires_at": expires_at,
+        "granted_at": current_time,
+        "duration_seconds": duration_seconds
+    }
+    ch.setdefault("blocked", {}).pop(str(user.id), None)
+
+    # Enregistrer le hash anti-doublon + la référence séparément
+    payment_record = {
+        "user_id": user.id,
+        "date": datetime.now().strftime('%d/%m/%Y %H:%M'),
+        "channel": ch_name,
+        "amount_str": result["amount_str"],
+        "reference": reference
+    }
+    if payment_hash:
+        used_payments[payment_hash] = payment_record
+    # Indexer la référence/txid séparément pour détection rapide
+    if reference:
+        used_references[reference] = payment_record
+
+    save_data(data)
+
+    # Débloquer si banni
+    try:
+        await context.bot.unban_chat_member(int(cid), user.id)
+    except Exception:
+        pass
+
+    payment_state.pop(user.id, None)
+
+    expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
+    ref_line = f"🔖 Référence: `{reference}`\n" if reference else ""
+
+    # Générer un lien d'invitation unique (1 seule utilisation)
+    invite_link = None
+    try:
+        invite_obj = await context.bot.create_chat_invite_link(int(cid), member_limit=1)
+        invite_link = invite_obj.invite_link
+        pending_invites[(cid, str(user.id))] = invite_link
+    except Exception as e:
+        logger.warning(f"Impossible de créer le lien d'invitation pour {cid}: {e}")
+
+    # Confirmer à l'utilisateur avec le lien
+    if invite_link:
+        await update.message.reply_text(
+            f"🎉 **Paiement validé ! Accès activé.**\n\n"
+            f"📢 Canal: **{ch_name}**\n"
+            f"💰 Montant: **{result['amount_str']}**\n"
+            f"⏱ Durée: **{days_text}**\n"
+            f"📅 Expire le: {expire_str}\n"
+            f"{ref_line}\n"
+            f"👇 **Cliquez sur ce lien pour rejoindre le canal:**\n"
+            f"{invite_link}\n\n"
+            f"⚠️ Ce lien est à usage unique — ne le partagez pas.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"🎉 **Paiement validé ! Accès activé.**\n\n"
+            f"📢 Canal: **{ch_name}**\n"
+            f"💰 Montant: **{result['amount_str']}**\n"
+            f"⏱ Durée: **{days_text}**\n"
+            f"📅 Expire le: {expire_str}\n"
+            f"{ref_line}\n"
+            f"✅ Vous pouvez rejoindre le canal.\n"
+            f"_(Lien non disponible — contactez l'admin si nécessaire)_",
+            parse_mode="Markdown"
+        )
+
+    # Notifier les admins
+    await notify_admins_payment(
+        context, user, cid, ch_name, result["amount_str"], hours,
+        photo.file_id, reference, result.get("raw_text", "")
+    )
+
+
+async def notify_admins_payment(context, user, cid: str, ch_name: str,
+                                 amount_str: str, hours: int, photo_file_id: str,
+                                 reference: str = "", raw_text: str = ""):
+    """Notifie les admins d'un nouveau paiement validé"""
+    dur_label = format_duration_label(hours * 3600)
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    username = f"@{user.username}" if user.username else "N/A"
+    ref_line = f"🔖 Référence: `{reference}`\n" if reference else ""
+    ocr_preview = f"\n📄 _OCR: {raw_text[:120].strip()}_" if raw_text else ""
+
+    caption = (
+        f"💳 **Nouveau paiement reçu!**\n\n"
+        f"👤 Utilisateur: **{full_name}** ({username})\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"📢 Canal: **{ch_name}**\n"
+        f"💰 Montant: **{amount_str}**\n"
+        f"{ref_line}"
+        f"⏱ Accès accordé: **{dur_label}**\n"
+        f"✅ Accès activé automatiquement."
+        f"{ocr_preview}"
+    )
+
+    for admin_id in ADMINS:
+        try:
+            await context.bot.send_photo(
+                admin_id,
+                photo=photo_file_id,
+                caption=caption,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            try:
+                await context.bot.send_message(admin_id, caption, parse_mode="Markdown")
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMMANDES TELETHON (Compte utilisateur personnel)
+# ═══════════════════════════════════════════════════════════════
+
+async def save_telethon_session(session_str: str, context, admin_id: int):
+    """Sauvegarde la session Telethon dans un fichier et notifie l'admin"""
+    # Sauvegarder dans un fichier local pour persistance
+    try:
+        with open("telethon_session.txt", "w") as f:
+            f.write(session_str)
+        logger.info("Session Telethon sauvegardée dans telethon_session.txt")
+    except Exception as e:
+        logger.error(f"Erreur sauvegarde session: {e}")
+
+    # Message partie 1: confirmation
+    await context.bot.send_message(
+        admin_id,
+        f"✅ **Connexion Telethon réussie et session sauvegardée!**\n\n"
+        f"La session est stockée localement dans `telethon_session.txt`.\n\n"
+        f"📋 **Pour utiliser sur Render.com** → voir message suivant:",
+        parse_mode="Markdown"
+    )
+
+    # Message partie 2: la session string brute (pour copier-coller)
+    await context.bot.send_message(
+        admin_id,
+        f"🔑 **Votre TELETHON\\_SESSION:**\n\n"
+        f"`{session_str}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 **Sur Render.com:**\n"
+        f"1. Dashboard → votre service → **Environment**\n"
+        f"2. Cliquez **Add Environment Variable**\n"
+        f"3. Key: `TELETHON_SESSION`\n"
+        f"4. Value: collez la chaîne ci-dessus\n"
+        f"5. **Save Changes** → redéployez\n\n"
+        f"📌 **Sur Replit:**\n"
+        f"Secrets → `TELETHON_SESSION` → collez la chaîne\n\n"
+        f"⚠️ Ne partagez jamais cette session — elle donne accès à votre compte.",
+        parse_mode="Markdown"
+    )
+
+
+async def connect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lance l'authentification Telethon"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if not TELETHON_API_ID or not TELETHON_API_HASH:
+        await update.message.reply_text(
+            "❌ **API Telethon non configurée.**\n\n"
+            "Ajoutez ces secrets dans Replit:\n"
+            "• `TELETHON_API_ID` — votre API ID\n"
+            "• `TELETHON_API_HASH` — votre API Hash\n\n"
+            "Obtenez-les sur https://my.telegram.org",
+            parse_mode="Markdown"
+        )
+        return
+
+    uid = update.effective_user.id
+    # Si le numéro est passé directement en argument (ex: /connect +22507XXXXXXXX)
+    if context.args:
+        phone_arg = context.args[0].strip()
+        # Démarrer l'auth et passer directement à l'étape numéro
+        init_msg = await telethon_manager.start_auth(uid)
+        if "Déjà connecté" in init_msg:
+            await update.message.reply_text(init_msg, parse_mode="Markdown")
+            return
+        # Traiter le numéro immédiatement
+        msg, done = await telethon_manager.process_auth_step(uid, phone_arg)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        msg = await telethon_manager.start_auth(uid)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Déconnecte le client Telethon"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    try:
+        client = telethon_manager.get_client()
+        if client.is_connected():
+            await client.disconnect()
+        telethon_manager.telethon_client = None
+        await update.message.reply_text("✅ Telethon déconnecté.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur: {e}")
+
+
+async def telethon_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le statut de la connexion Telethon"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if not TELETHON_API_ID:
+        await update.message.reply_text(
+            "⚠️ `TELETHON_API_ID` non configuré.",
+            parse_mode="Markdown"
+        )
+        return
+
+    connected = await telethon_manager.is_connected()
+    if connected:
+        client = telethon_manager.get_client()
+        me = await client.get_me()
+        await update.message.reply_text(
+            f"✅ **Telethon connecté**\n\n"
+            f"👤 Compte: **{me.first_name}** (@{me.username or me.id})\n"
+            f"📡 Accès complet aux membres des canaux activé.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "🔴 **Telethon non connecté**\n\n"
+            "Utilisez /connect pour vous authentifier.",
+            parse_mode="Markdown"
+        )
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force un scan Telethon d'un canal"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Accès refusé.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: `/scan <id_canal>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    cid = context.args[0]
+    data = load_data()
+    if cid not in data.get("channels", {}):
+        await update.message.reply_text("❌ Canal inconnu. Ajoutez d'abord le bot au canal.")
+        return
+
+    ch = data["channels"][cid]
+    channel_name = ch.get("name", cid)
+
+    await update.message.reply_text(
+        f"🔍 Scan du canal **{channel_name}** en cours...",
+        parse_mode="Markdown"
+    )
+
+    asyncio.create_task(scan_channel_members(context, int(cid), channel_name))
+
+
+# ═══════════════════════════════════════════════════════════════
+# TÂCHE DE VÉRIFICATION DES EXPIRATIONS
+# ═══════════════════════════════════════════════════════════════
+
+async def check_expirations_task(application: Application):
+    while True:
+        try:
+            data = load_data()
+            current_time = int(datetime.now().timestamp())
+            changed = False
+
+            for cid, ch in data.get("channels", {}).items():
+                to_remove = [
+                    uid for uid, m in ch.get("members", {}).items()
+                    if m.get("expires_at", 0) <= current_time
+                ]
+
+                for uid in to_remove:
+                    # Ban sans unban = retrait immédiat + blocage
+                    try:
+                        await application.bot.ban_chat_member(int(cid), int(uid))
+                        logger.info(f"✅ Membre {uid} expiré — banni du canal {cid}")
+                    except Exception as e:
+                        logger.error(f"Erreur ban {uid} canal {cid}: {e}")
+
+                    # Ajouter à la liste des bloqués
+                    ch.setdefault("blocked", {})[uid] = {
+                        "blocked_at": current_time
+                    }
+
+                    # Message de paiement envoyé à l'utilisateur
+                    try:
+                        await application.bot.send_message(
+                            int(uid),
+                            f"⏰ **Accès expiré — {ch['name']}**\n\n"
+                            f"Votre accès à ce canal a expiré et vous avez été retiré.\n\n"
+                            f"🚫 Toute tentative de retour sera automatiquement bloquée.\n\n"
+                            f"💳 Pour renouveler votre abonnement, contactez notre assistant:\n"
+                            f"👉 Appuyez sur /start",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+
+                    del ch["members"][uid]
+                    changed = True
+
+            if changed:
+                save_data(data)
+
+        except Exception as e:
+            logger.error(f"Erreur check_expirations: {e}")
+
+        await asyncio.sleep(30)  # Vérification toutes les 30 secondes
+
+
+# ═══════════════════════════════════════════════════════════════
+# FONCTION PRINCIPALE
+# ═══════════════════════════════════════════════════════════════
+
+async def main():
+    logger.info("🤖 Démarrage du bot multi-canal...")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Commandes
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("channels", channels_command))
+    application.add_handler(CommandHandler("members", members_command))
+    application.add_handler(CommandHandler("remove", remove_command))
+    application.add_handler(CommandHandler("setduration", setduration_command))
+    application.add_handler(CommandHandler("ai_on", ai_on_command))
+    application.add_handler(CommandHandler("ai_off", ai_off_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("payer", payer_command))
+    application.add_handler(CommandHandler("annuler", annuler_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CommandHandler("extend", extend_command))
+    application.add_handler(CommandHandler("bonus", bonus_command))
+    application.add_handler(CommandHandler("unblock", unblock_command))
+    application.add_handler(CommandHandler("connect", connect_command))
+    application.add_handler(CommandHandler("disconnect", disconnect_command))
+    application.add_handler(CommandHandler("telethon", telethon_status_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+
+    # Callbacks boutons
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    # Événements membres du canal
+    application.add_handler(ChatMemberHandler(handle_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Captures d'écran de paiement — photos en chat privé
+    application.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        handle_payment_photo
+    ))
+
+    # Messages utilisateurs (réponse IA) — uniquement dans les chats privés, hors commandes
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_user_message
+    ))
+
+    await start_web_server()
+    await application.initialize()
+    await application.start()
+    asyncio.create_task(check_expirations_task(application))
+
+    logger.info("✅ Bot multi-canal démarré avec succès!")
+
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"]
+    )
+
+    while True:
+        await asyncio.sleep(3600)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
