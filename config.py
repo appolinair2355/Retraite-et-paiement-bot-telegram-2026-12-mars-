@@ -12,7 +12,7 @@ ADMINS = [int(x.strip()) for x in ADMINS_STR.split(",") if x.strip()]
 
 PORT = int(os.getenv("PORT", "10000"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDILwqwc5ofu2quvWHXhqHII32y0zkMLRM")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCLIkisyBGwLq6GZccGcCijvCFzdzZczsU")
 
 TELETHON_API_ID = int(os.getenv("TELETHON_API_ID", "29177661"))
 TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "a8639172fa8d35dbfd8ea46286d349ab")
