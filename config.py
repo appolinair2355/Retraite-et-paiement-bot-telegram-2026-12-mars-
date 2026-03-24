@@ -1,6 +1,6 @@
 """
 Bot Telegram - Gestionnaire d'Accès Multi-Canal
-Configuration complète pour déploiement Render.com (port 10000)
+Configuration pour déploiement Render.com (port 10000)
 """
 
 import os

@@ -107,13 +107,18 @@ def get_channel_data(data, channel_id):
     if cid not in data["channels"]:
         data["channels"][cid] = {
             "name": f"Canal {cid}",
-            "default_duration_hours": 24,
+            "default_duration_seconds": 86400,
             "members": {},
             "blocked": {}
         }
     ch = data["channels"][cid]
     if "blocked" not in ch:
         ch["blocked"] = {}
+    # Migration automatique: ancien champ → nouveau champ
+    if "default_duration_seconds" not in ch and "default_duration_hours" in ch:
+        ch["default_duration_seconds"] = ch["default_duration_hours"] * 3600
+    elif "default_duration_seconds" not in ch:
+        ch["default_duration_seconds"] = 86400
     return ch
 
 
@@ -133,14 +138,13 @@ def format_duration_label(total_seconds: int) -> str:
 def member_keyboard(cid: str, uid: str, default_hours: int):
     """Clavier standard pour accorder l'accès à un membre"""
     return [
-        [InlineKeyboardButton("⏱ 2min",  callback_data=f"grantm_{cid}_{uid}_2"),
-         InlineKeyboardButton("⏱ 10min", callback_data=f"grantm_{cid}_{uid}_10"),
-         InlineKeyboardButton("⏱ 20min", callback_data=f"grantm_{cid}_{uid}_20"),
-         InlineKeyboardButton("⏱ 30min", callback_data=f"grantm_{cid}_{uid}_30")],
-        [InlineKeyboardButton(
-            f"⏱ Défaut ({default_hours}h)",
-            callback_data=f"grant_{cid}_{uid}_{default_hours}"
-        )],
+        [InlineKeyboardButton("⏱ 30min", callback_data=f"grantm_{cid}_{uid}_30"),
+         InlineKeyboardButton("⏱ 1h",    callback_data=f"grant_{cid}_{uid}_1"),
+         InlineKeyboardButton("⏱ 5h",    callback_data=f"grant_{cid}_{uid}_5")],
+        [InlineKeyboardButton("⏱ 24h",   callback_data=f"grant_{cid}_{uid}_24"),
+         InlineKeyboardButton("⏱ 48h",   callback_data=f"grant_{cid}_{uid}_48")],
+        [InlineKeyboardButton("📅 7 jours",  callback_data=f"grant_{cid}_{uid}_168"),
+         InlineKeyboardButton("📅 1 mois",   callback_data=f"grant_{cid}_{uid}_720")],
         [InlineKeyboardButton("❌ Retirer maintenant", callback_data=f"kick_{cid}_{uid}")]
     ]
 
@@ -435,10 +439,13 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
         for admin_id in ADMINS:
             try:
                 keyboard = [
-                    [InlineKeyboardButton("⏱ 24h", callback_data=f"setdef_{cid}_24"),
-                     InlineKeyboardButton("⏱ 48h", callback_data=f"setdef_{cid}_48")],
-                    [InlineKeyboardButton("⏱ 7 jours", callback_data=f"setdef_{cid}_168"),
-                     InlineKeyboardButton("⏱ 30 jours", callback_data=f"setdef_{cid}_720")],
+                    [InlineKeyboardButton("⏱ 30min", callback_data=f"setdef_{cid}_1800"),
+                     InlineKeyboardButton("⏱ 1h",    callback_data=f"setdef_{cid}_3600"),
+                     InlineKeyboardButton("⏱ 5h",    callback_data=f"setdef_{cid}_18000")],
+                    [InlineKeyboardButton("⏱ 24h",   callback_data=f"setdef_{cid}_86400"),
+                     InlineKeyboardButton("⏱ 48h",   callback_data=f"setdef_{cid}_172800")],
+                    [InlineKeyboardButton("📅 7 jours",  callback_data=f"setdef_{cid}_604800"),
+                     InlineKeyboardButton("📅 1 mois",   callback_data=f"setdef_{cid}_2592000")],
                 ]
                 await context.bot.send_message(
                     admin_id,
@@ -484,7 +491,7 @@ async def scan_channel_members(context, channel_id, channel_name):
         cid = str(channel_id)
         ch = get_channel_data(data, channel_id)
         existing_members = set(ch.get("members", {}).keys())
-        default_hours = ch.get("default_duration_hours", 24)
+        default_hours = ch.get("default_duration_seconds", 86400)
 
         # Essayer Telethon en priorité (accès à tous les membres)
         telethon_users = []
@@ -599,16 +606,74 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
         username = f"@{user.username}" if user.username else "N/A"
 
+        # ── Message d'accueil envoyé à TOUS les membres qui rejoignent ──
+        mode_emploi = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 **MODE D'EMPLOI – BOT DE PRÉDICTION BACCARAT**\n\n"
+            f"🎯 **Principe de fonctionnement**\n"
+            f"Le bot prédit les cartes suivantes :\n"
+            f"♠️ (Pique), ♦️ (Carreau), ♣️ (Trèfle), ❤️ (Cœur).\n\n"
+            f"🕹️ **Comment utiliser les prédictions**\n"
+            f"▪️ Le bot affiche un numéro de manche en tête.\n"
+            f"▪️ Allez sur votre plateforme de jeu (bookmaker), section Baccarat, et trouvez ce numéro.\n"
+            f"▪️ Sélectionnez : 👉 « Le joueur reçoit une carte enseigne »\n"
+            f"▪️ Choisissez la carte indiquée par le bot.\n\n"
+            f"🔁 **En cas d'échec**\n"
+            f"👉 Passez immédiatement au numéro suivant (affiché en bas des prédictions) et rejouez.\n\n"
+            f"⚠️ **Recommandations stratégiques**\n"
+            f"▪️ Attendez une première perte du bot avant de miser (recommandé).\n"
+            f"▪️ Les plus confiants peuvent jouer dès la première prédiction.\n"
+            f"▪️ Le bot émet 4 prédictions consécutives, puis s'arrête (nouvelle série).\n\n"
+            f"💰 **Plan de mise (progression recommandée)**\n"
+            f"▪️ 500 FCFA → 1 200 FCFA → 2 500 FCFA\n"
+            f"▪️ 5 500 FCFA → 12 000 FCFA → 25 000 FCFA\n"
+            f"👉 En cas de gain : revenez à 500 FCFA.\n\n"
+            f"🧠 **Conseils essentiels**\n"
+            f"▪️ Respectez rigoureusement le plan de mise.\n"
+            f"▪️ Max 4 prédictions par jour.\n"
+            f"▪️ Ne dépassez pas les 6 niveaux de mise.\n"
+            f"▪️ Évitez toute décision impulsive.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 **MODE DE PAIEMENT & RENOUVELLEMENT**\n\n"
+            f"1️⃣ Tapez /start dans ce bot pour ouvrir le menu principal.\n"
+            f"2️⃣ Appuyez sur 💳 **Payer mon abonnement** (ou tapez /payer).\n"
+            f"3️⃣ Envoyez une capture d'écran de votre paiement (Wave, Orange Money, PayPal, BNB, etc.).\n"
+            f"4️⃣ Le bot analyse automatiquement le montant et calcule votre durée d'accès.\n"
+            f"5️⃣ Choisissez le canal souhaité — votre accès est activé immédiatement.\n\n"
+            f"🎁 **Demander un accès bonus (gratuit)**\n"
+            f"▪️ Tapez /bonus dans ce bot et suivez les instructions.\n"
+            f"▪️ La demande est soumise à l'approbation de l'administrateur.\n\n"
+            f"💬 **Besoin d'aide ?**\n"
+            f"Appuyez sur 💬 **Assistance** dans le menu /start pour discuter avec notre assistante.\n"
+            f"❓ Si vous ne comprenez pas quelque chose, écrivez directement à @Kouam2025_bot — elle vous guidera étape par étape.\n\n"
+            f"💳 Pour renouveler ou toute question : @Kouam2025_bot"
+        )
+
         # Vérifier si c'est un membre payant (déjà enregistré via paiement)
         if uid in ch.get("members", {}):
-            # Membre payant — notifier l'admin avec bouton Confirmer pour révoquer le lien
-            key = (cid, uid)
-            invite_link = pending_invites.get(key, "")
             member_info = ch["members"][uid]
             expires_at = member_info.get("expires_at", 0)
             dur_sec = member_info.get("duration_seconds", 0)
             dur_label = format_duration_label(dur_sec)
             expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M') if expires_at else "?"
+
+            try:
+                await context.bot.send_message(
+                    int(uid),
+                    f"🎉 **Bienvenue dans {ch['name']}!**\n\n"
+                    f"✅ Votre accès est actif.\n"
+                    f"⏱ Durée: **{dur_label}**\n"
+                    f"📅 Expire le: **{expire_str}**\n\n"
+                    f"⚠️ Votre accès sera automatiquement retiré à expiration.\n\n"
+                    + mode_emploi,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Erreur envoi message d'accueil à {uid}: {e}")
+
+            # Notifier l'admin avec bouton Confirmer pour révoquer le lien
+            key = (cid, uid)
+            invite_link = pending_invites.get(key, "")
 
             confirm_kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Confirmer l'intégration", callback_data=f"cjoin_{uid}_{cid}")
@@ -630,8 +695,19 @@ async def handle_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 except Exception as e:
                     logger.error(f"Erreur notif admin {admin_id}: {e}")
         else:
-            # Membre inconnu — demander à l'admin combien de temps accorder
-            default_hours = ch.get("default_duration_hours", 24)
+            # Membre inconnu — envoyer le message d'accueil puis notifier l'admin
+            try:
+                await context.bot.send_message(
+                    int(uid),
+                    f"🎉 **Bienvenue dans {ch['name']}!**\n\n"
+                    f"✅ Vous avez bien rejoint le canal.\n\n"
+                    + mode_emploi,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Erreur envoi message d'accueil à {uid}: {e}")
+
+            default_hours = ch.get("default_duration_seconds", 86400)
             for admin_id in ADMINS:
                 try:
                     await context.bot.send_message(
@@ -699,6 +775,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Afficher le menu principal
         user_keyboard = [
+            [InlineKeyboardButton("📊 Mon statut d'abonnement", callback_data="my_status")],
             [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
             [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
             [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
@@ -707,6 +784,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id,
             f"🏠 **Menu principal**\n\n"
             f"Que souhaitez-vous faire ?\n\n"
+            f"• 📊 Vérifier votre **durée restante** d'accès\n"
             f"• 💳 Payer votre abonnement (**50 USD/mois** ou {PRICE_PER_DAY_FCFA} FCFA/jour)\n"
             f"• 🎁 Demander un accès gratuit (bonus)\n"
             f"• 💬 Contacter l'assistance",
@@ -716,6 +794,65 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Callbacks accessibles à tous les utilisateurs ─────────────────
+    if query.data == "my_status":
+        user = update.effective_user
+        uid_str = str(user.id)
+        data = load_data()
+        channels = data.get("channels", {})
+        current_time = int(datetime.now().timestamp())
+        found = False
+        lines = [f"📊 **Statut de vos abonnements**\n👤 {user.first_name}\n"]
+
+        for cid, ch in channels.items():
+            members = ch.get("members", {})
+            if uid_str in members:
+                m = members[uid_str]
+                expires_at = m.get("expires_at", 0)
+                time_left = expires_at - current_time
+                dur_total = format_duration_label(m.get("duration_seconds", 0))
+                expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M') if expires_at else "?"
+                if time_left > 0:
+                    remaining = format_time_remaining(time_left)
+                    lines.append(
+                        f"📢 **{ch.get('name', cid)}**\n"
+                        f"   ✅ Accès **ACTIF**\n"
+                        f"   ⏳ Temps restant: **{remaining}**\n"
+                        f"   📅 Expire le: {expire_str}\n"
+                        f"   ⏱ Durée totale: {dur_total}\n"
+                    )
+                else:
+                    lines.append(
+                        f"📢 **{ch.get('name', cid)}**\n"
+                        f"   🔴 Accès **EXPIRÉ** depuis le {expire_str}\n"
+                    )
+                found = True
+
+        if not found:
+            lines.append("ℹ️ Vous n'avez aucun abonnement enregistré.\n\nAppuyez sur 💳 *Payer mon abonnement* pour souscrire.")
+
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu principal", callback_data="back_main")]])
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=back_kb)
+        return
+
+    if query.data == "back_main":
+        user = update.effective_user
+        user_keyboard = [
+            [InlineKeyboardButton("📊 Mon statut d'abonnement", callback_data="my_status")],
+            [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
+            [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
+            [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
+        ]
+        await query.edit_message_text(
+            f"🏠 **Menu principal**\n\n"
+            f"• 📊 Vérifier votre **durée restante** d'accès\n"
+            f"• 💳 Payer votre abonnement (**50 USD/mois** ou {PRICE_PER_DAY_FCFA} FCFA/jour)\n"
+            f"• 🎁 Demander un accès gratuit (bonus)\n"
+            f"• 💬 Contacter l'assistance",
+            reply_markup=InlineKeyboardMarkup(user_keyboard),
+            parse_mode="Markdown"
+        )
+        return
+
     if query.data == "pay_start":
         user = update.effective_user
         data = load_data()
@@ -823,13 +960,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Notifier les admins avec boutons d'approbation
-        approve_keyboard = []
-        for h_label, h_val in [("1 jour (24h)", 24), ("3 jours (72h)", 72),
-                                 ("7 jours (168h)", 168), ("1 mois (720h)", 720)]:
-            approve_keyboard.append([InlineKeyboardButton(
-                f"✅ {h_label}", callback_data=f"bapprove_{requester_uid}_{cid}_{h_val}"
-            )])
-        approve_keyboard.append([InlineKeyboardButton("❌ Refuser", callback_data=f"bdeny_{requester_uid}_{cid}")])
+        approve_keyboard = [
+            [
+                InlineKeyboardButton("✅ 30min", callback_data=f"bapprove_{requester_uid}_{cid}_1800"),
+                InlineKeyboardButton("✅ 1h",    callback_data=f"bapprove_{requester_uid}_{cid}_3600"),
+                InlineKeyboardButton("✅ 5h",    callback_data=f"bapprove_{requester_uid}_{cid}_18000"),
+            ],
+            [
+                InlineKeyboardButton("✅ 24h",   callback_data=f"bapprove_{requester_uid}_{cid}_86400"),
+                InlineKeyboardButton("✅ 48h",   callback_data=f"bapprove_{requester_uid}_{cid}_172800"),
+            ],
+            [
+                InlineKeyboardButton("✅ 7 jours", callback_data=f"bapprove_{requester_uid}_{cid}_604800"),
+                InlineKeyboardButton("✅ 1 mois",  callback_data=f"bapprove_{requester_uid}_{cid}_2592000"),
+            ],
+            [InlineKeyboardButton("❌ Refuser", callback_data=f"bdeny_{requester_uid}_{cid}")],
+        ]
 
         for admin_id in ADMINS:
             try:
@@ -882,14 +1028,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         requester_uid = int(parts[1])
         cid = parts[2]
-        hours = int(parts[3])
+        duration_seconds = int(parts[3])
         data = load_data()
         if cid not in data.get("channels", {}):
             await query.edit_message_text("❌ Canal introuvable.")
             return
         ch = data["channels"][cid]
         current_time = int(datetime.now().timestamp())
-        duration_seconds = hours * 3600
         expires_at = current_time + duration_seconds
         ch.setdefault("members", {})[str(requester_uid)] = {
             "expires_at": expires_at, "granted_at": current_time, "duration_seconds": duration_seconds
@@ -897,23 +1042,46 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch.setdefault("blocked", {}).pop(str(requester_uid), None)
         save_data(data)
         try:
-            await context.bot.unban_chat_member(int(cid), requester_uid)
+            await context.bot.unban_chat_member(int(cid), requester_uid, only_if_banned=True)
         except Exception:
             pass
         bonus_state.pop(requester_uid, None)
         dur_label = format_duration_label(duration_seconds)
         expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
+        # Générer un lien d'invitation unique pour le bonus
+        bonus_invite_link = None
         try:
-            await context.bot.send_message(
-                requester_uid,
-                f"🎉 **Accès bonus approuvé!**\n\n"
-                f"📢 Canal: **{ch['name']}**\n"
-                f"⏱ Durée: **{dur_label}**\n"
-                f"📅 Expire le: {expire_str}\n\n"
-                f"✅ Vous pouvez maintenant rejoindre le canal.\n"
-                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
-                parse_mode="Markdown"
-            )
+            invite_obj = await context.bot.create_chat_invite_link(int(cid), member_limit=1)
+            bonus_invite_link = invite_obj.invite_link
+            pending_invites[(cid, str(requester_uid))] = bonus_invite_link
+        except Exception as e:
+            logger.warning(f"Impossible de créer le lien bonus pour {cid}: {e}")
+
+        try:
+            if bonus_invite_link:
+                await context.bot.send_message(
+                    requester_uid,
+                    f"🎉 **Accès bonus approuvé!**\n\n"
+                    f"📢 Canal: **{ch['name']}**\n"
+                    f"⏱ Durée: **{dur_label}**\n"
+                    f"📅 Expire le: {expire_str}\n\n"
+                    f"👇 **Cliquez sur ce lien pour rejoindre le canal:**\n"
+                    f"{bonus_invite_link}\n\n"
+                    f"⚠️ Ce lien est à usage unique — ne le partagez pas.\n"
+                    f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.send_message(
+                    requester_uid,
+                    f"🎉 **Accès bonus approuvé!**\n\n"
+                    f"📢 Canal: **{ch['name']}**\n"
+                    f"⏱ Durée: **{dur_label}**\n"
+                    f"📅 Expire le: {expire_str}\n\n"
+                    f"✅ Vous pouvez maintenant rejoindre le canal.\n"
+                    f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                    parse_mode="Markdown"
+                )
         except Exception:
             pass
         admin_name = update.effective_user.first_name or "Admin"
@@ -973,17 +1141,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "setdef":
         cid = parts[1]
-        hours = int(parts[2])
+        duration_seconds = int(parts[2])
         data = load_data()
         if cid in data.get("channels", {}):
-            data["channels"][cid]["default_duration_hours"] = hours
+            data["channels"][cid]["default_duration_seconds"] = duration_seconds
             ch_name = data["channels"][cid].get("name", cid)
             save_data(data)
-            dur = f"{hours//24}j" if hours >= 24 else f"{hours}h"
+            dur_label = format_duration_label(duration_seconds)
             await query.edit_message_text(
                 f"✅ **Durée par défaut mise à jour!**\n\n"
                 f"📢 Canal: {ch_name}\n"
-                f"⏱ Durée: {dur}",
+                f"⏱ Durée: {dur_label}",
                 parse_mode="Markdown"
             )
         else:
@@ -1018,16 +1186,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dur_label = format_duration_label(duration_seconds)
         expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M:%S')
 
+        # Générer un lien d'invitation unique pour l'utilisateur
+        grant_invite_link = None
         try:
-            await context.bot.send_message(
-                int(uid),
-                f"✅ **Accès accordé!**\n\n"
-                f"📢 Canal: **{ch['name']}**\n"
-                f"⏱ Durée: **{dur_label}**\n"
-                f"📅 Expire le: {expire_str}\n\n"
-                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
-                parse_mode="Markdown"
-            )
+            invite_obj = await context.bot.create_chat_invite_link(int(cid), member_limit=1)
+            grant_invite_link = invite_obj.invite_link
+            pending_invites[(cid, uid)] = grant_invite_link
+        except Exception as e:
+            logger.warning(f"Impossible de créer le lien pour {cid}: {e}")
+
+        try:
+            if grant_invite_link:
+                await context.bot.send_message(
+                    int(uid),
+                    f"✅ **Accès accordé!**\n\n"
+                    f"📢 Canal: **{ch['name']}**\n"
+                    f"⏱ Durée: **{dur_label}**\n"
+                    f"📅 Expire le: {expire_str}\n\n"
+                    f"👇 **Cliquez sur ce lien pour rejoindre le canal:**\n"
+                    f"{grant_invite_link}\n\n"
+                    f"⚠️ Ce lien est à usage unique — ne le partagez pas.\n"
+                    f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await context.bot.send_message(
+                    int(uid),
+                    f"✅ **Accès accordé!**\n\n"
+                    f"📢 Canal: **{ch['name']}**\n"
+                    f"⏱ Durée: **{dur_label}**\n"
+                    f"📅 Expire le: {expire_str}\n\n"
+                    f"✅ Vous pouvez rejoindre le canal.\n"
+                    f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                    parse_mode="Markdown"
+                )
         except Exception:
             pass
 
@@ -1035,7 +1227,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ **Accès accordé!**\n\n"
             f"🆔 Utilisateur: `{uid}`\n"
             f"⏱ Durée: **{dur_label}**\n"
-            f"📅 Expire: {expire_str}",
+            f"📅 Expire: {expire_str}\n"
+            f"🔗 Lien envoyé à l'utilisateur.",
             parse_mode="Markdown"
         )
 
@@ -1111,7 +1304,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Débloquer si banni
         try:
-            await context.bot.unban_chat_member(int(cid), payer_uid)
+            await context.bot.unban_chat_member(int(cid), payer_uid, only_if_banned=True)
         except Exception:
             pass
 
@@ -1172,19 +1365,67 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         user_keyboard = [
+            [InlineKeyboardButton("📊 Mon statut d'abonnement", callback_data="my_status")],
             [InlineKeyboardButton("💳 Payer mon abonnement", callback_data="pay_start")],
             [InlineKeyboardButton("🎁 Demander un bonus", callback_data="bonus_start")],
             [InlineKeyboardButton("💬 Assistance", callback_data="assist_start")]
         ]
         await update.message.reply_text(
             "👋 **Bienvenue!**\n\n"
+            f"• 📊 Vérifier votre **durée restante** d'accès\n"
             f"• 💳 Abonnement mensuel: **50 USD / mois**\n"
             f"• 💵 Ou: **{PRICE_PER_DAY_FCFA} FCFA / jour**\n"
-            f"• 🎁 Vous pouvez demander un accès gratuit (bonus)\n"
+            f"• 🎁 Demander un accès gratuit (bonus)\n"
             f"• 💬 Contacter l'assistance",
             reply_markup=InlineKeyboardMarkup(user_keyboard),
             parse_mode="Markdown"
         )
+
+
+async def statut_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Afficher la durée restante d'abonnement pour l'utilisateur"""
+    user = update.effective_user
+    uid_str = str(user.id)
+    data = load_data()
+    channels = data.get("channels", {})
+    current_time = int(datetime.now().timestamp())
+    found = False
+    lines = [f"📊 **Statut de vos abonnements**\n👤 {user.first_name}\n"]
+
+    for cid, ch in channels.items():
+        members = ch.get("members", {})
+        if uid_str in members:
+            m = members[uid_str]
+            expires_at = m.get("expires_at", 0)
+            time_left = expires_at - current_time
+            dur_total = format_duration_label(m.get("duration_seconds", 0))
+            expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M') if expires_at else "?"
+            if time_left > 0:
+                remaining = format_time_remaining(time_left)
+                lines.append(
+                    f"📢 **{ch.get('name', cid)}**\n"
+                    f"   ✅ Accès **ACTIF**\n"
+                    f"   ⏳ Temps restant: **{remaining}**\n"
+                    f"   📅 Expire le: {expire_str}\n"
+                    f"   ⏱ Durée totale: {dur_total}\n"
+                )
+            else:
+                lines.append(
+                    f"📢 **{ch.get('name', cid)}**\n"
+                    f"   🔴 Accès **EXPIRÉ** depuis le {expire_str}\n"
+                )
+            found = True
+
+    if not found:
+        lines.append(
+            "ℹ️ Vous n'avez aucun abonnement enregistré.\n\n"
+            "Tapez /start pour souscrire ou demander un bonus."
+        )
+
+    back_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 Menu principal", callback_data="back_main")
+    ]])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=back_kb)
 
 
 async def ai_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1230,12 +1471,13 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         members = ch.get("members", {})
         active = sum(1 for m in members.values() if m.get("expires_at", 0) > current_time)
         expired = len(members) - active
-        default_h = ch.get("default_duration_hours", 24)
+        default_secs = ch.get("default_duration_seconds", ch.get("default_duration_hours", 24) * 3600)
+        dur_label = format_duration_label(default_secs)
         msg += (
             f"📢 **{ch.get('name', cid)}**\n"
             f"   🆔 `{cid}`\n"
             f"   👥 {active} actif(s) | 🔴 {expired} expiré(s)\n"
-            f"   ⏱ Défaut: {default_h}h\n\n"
+            f"   ⏱ Défaut: {dur_label}\n\n"
         )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -1317,18 +1559,19 @@ async def setduration_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "❌ Usage: `/setduration <id_canal> <heures>`\n"
             "Exemple: `/setduration -1001234567890 24`\n"
-            "_Définit la durée par défaut du bouton Défaut._",
+            "_Définit la durée par défaut (en heures entières, ex: 0.5 pour 30min)._",
             parse_mode="Markdown"
         )
         return
 
     cid = context.args[0]
     try:
-        hours = int(context.args[1])
-        if not (1 <= hours <= 750):
+        hours_float = float(context.args[1])
+        if not (0.1 <= hours_float <= 750):
             raise ValueError
+        duration_seconds = int(hours_float * 3600)
     except ValueError:
-        await update.message.reply_text("❌ Durée invalide. Entrez un nombre entre 1 et 750.")
+        await update.message.reply_text("❌ Durée invalide. Entrez un nombre entre 0.1 et 750 (heures).")
         return
 
     data = load_data()
@@ -1336,10 +1579,11 @@ async def setduration_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Canal introuvable.")
         return
 
-    data["channels"][cid]["default_duration_hours"] = hours
+    data["channels"][cid]["default_duration_seconds"] = duration_seconds
     save_data(data)
+    dur_label = format_duration_label(duration_seconds)
     await update.message.reply_text(
-        f"✅ Durée par défaut mise à jour: **{hours}h** pour **{data['channels'][cid]['name']}**",
+        f"✅ Durée par défaut mise à jour: **{dur_label}** pour **{data['channels'][cid]['name']}**",
         parse_mode="Markdown"
     )
 
@@ -1390,16 +1634,40 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dur_label = format_duration_label(duration_seconds)
     expire_str = datetime.fromtimestamp(expires_at).strftime('%d/%m/%Y à %H:%M')
 
+    # Générer un lien d'invitation unique
+    cmd_invite_link = None
     try:
-        await context.bot.send_message(
-            int(uid),
-            f"✅ **Accès accordé!**\n\n"
-            f"📢 Canal: **{ch['name']}**\n"
-            f"⏱ Durée: **{dur_label}**\n"
-            f"📅 Expire le: {expire_str}\n\n"
-            f"⚠️ Votre accès sera automatiquement retiré à expiration.",
-            parse_mode="Markdown"
-        )
+        invite_obj = await context.bot.create_chat_invite_link(int(cid), member_limit=1)
+        cmd_invite_link = invite_obj.invite_link
+        pending_invites[(cid, uid)] = cmd_invite_link
+    except Exception as e:
+        logger.warning(f"Impossible de créer le lien /grant pour {cid}: {e}")
+
+    try:
+        if cmd_invite_link:
+            await context.bot.send_message(
+                int(uid),
+                f"✅ **Accès accordé!**\n\n"
+                f"📢 Canal: **{ch['name']}**\n"
+                f"⏱ Durée: **{dur_label}**\n"
+                f"📅 Expire le: {expire_str}\n\n"
+                f"👇 **Cliquez sur ce lien pour rejoindre le canal:**\n"
+                f"{cmd_invite_link}\n\n"
+                f"⚠️ Ce lien est à usage unique — ne le partagez pas.\n"
+                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                parse_mode="Markdown"
+            )
+        else:
+            await context.bot.send_message(
+                int(uid),
+                f"✅ **Accès accordé!**\n\n"
+                f"📢 Canal: **{ch['name']}**\n"
+                f"⏱ Durée: **{dur_label}**\n"
+                f"📅 Expire le: {expire_str}\n\n"
+                f"✅ Vous pouvez rejoindre le canal.\n"
+                f"⚠️ Votre accès sera automatiquement retiré à expiration.",
+                parse_mode="Markdown"
+            )
     except Exception:
         pass
 
@@ -1408,7 +1676,8 @@ async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 Canal: {ch['name']}\n"
         f"🆔 Utilisateur: `{uid}`\n"
         f"⏱ Durée: **{dur_label}**\n"
-        f"📅 Expire: {expire_str}",
+        f"📅 Expire: {expire_str}\n"
+        f"🔗 Lien d'invitation envoyé à l'utilisateur.",
         parse_mode="Markdown"
     )
 
@@ -1439,7 +1708,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del ch["blocked"][uid]
         # Unban pour lui permettre de rejoindre
         try:
-            await context.bot.unban_chat_member(int(cid), int(uid))
+            await context.bot.unban_chat_member(int(cid), int(uid), only_if_banned=True)
         except Exception:
             pass
         save_data(data)
@@ -1508,7 +1777,7 @@ async def extend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expire_str = datetime.fromtimestamp(new_expiry).strftime('%d/%m/%Y à %H:%M')
 
     try:
-        await context.bot.unban_chat_member(int(cid), int(uid))
+        await context.bot.unban_chat_member(int(cid), int(uid), only_if_banned=True)
     except Exception:
         pass
 
@@ -2150,7 +2419,7 @@ async def handle_payment_photo(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Débloquer si banni
     try:
-        await context.bot.unban_chat_member(int(cid), user.id)
+        await context.bot.unban_chat_member(int(cid), user.id, only_if_banned=True)
     except Exception:
         pass
 
@@ -2429,8 +2698,8 @@ async def check_expirations_task(application: Application):
                             f"⏰ **Accès expiré — {ch['name']}**\n\n"
                             f"Votre accès à ce canal a expiré et vous avez été retiré.\n\n"
                             f"🚫 Toute tentative de retour sera automatiquement bloquée.\n\n"
-                            f"💳 Pour renouveler votre abonnement, contactez notre assistant:\n"
-                            f"👉 Appuyez sur /start",
+                            f"💳 Pour renouveler votre abonnement, écrivez à @Kouam2025_bot\n"
+                            f"👉 Ou appuyez sur /start dans ce bot.",
                             parse_mode="Markdown"
                         )
                     except Exception:
@@ -2459,6 +2728,7 @@ async def main():
 
     # Commandes
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("statut", statut_command))
     application.add_handler(CommandHandler("channels", channels_command))
     application.add_handler(CommandHandler("members", members_command))
     application.add_handler(CommandHandler("remove", remove_command))
